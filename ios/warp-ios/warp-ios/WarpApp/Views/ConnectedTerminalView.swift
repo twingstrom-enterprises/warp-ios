@@ -7,6 +7,7 @@ struct ConnectedTerminalView: View {
     @State private var showsJumpToBottom = false
     @State private var jumpToBottomRequest = 0
     @State private var showPasswordPrompt = false
+    @State private var didSubmitPassword = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -63,8 +64,15 @@ struct ConnectedTerminalView: View {
                 .foregroundStyle(.white)
             }
         }
-        .sheet(isPresented: $showPasswordPrompt) {
+        .sheet(isPresented: $showPasswordPrompt, onDismiss: {
+            // If the password sheet was cancelled (not submitted), leave this screen
+            // so we do not show an indefinite "Connecting…" spinner.
+            if case .password = host.authMethod, !didSubmitPassword {
+                dismiss()
+            }
+        }) {
             PasswordPromptView(hostname: host.hostname, username: host.username) { pw in
+                didSubmitPassword = true
                 Task { await session.connect(host: host, password: pw) }
             }
         }
@@ -77,6 +85,7 @@ struct ConnectedTerminalView: View {
         }
         .task {
             if case .password = host.authMethod {
+                didSubmitPassword = false
                 showPasswordPrompt = true
             } else {
                 await session.connect(host: host)
@@ -91,6 +100,7 @@ struct PasswordPromptView: View {
     let onConnect: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var password = ""
+    @FocusState private var isPasswordFocused: Bool
 
     var body: some View {
         NavigationStack {
@@ -98,20 +108,33 @@ struct PasswordPromptView: View {
                 Section("\(username)@\(hostname)") {
                     SecureField("Password", text: $password)
                         .textContentType(.password)
+                        .submitLabel(.go)
+                        .onSubmit(connect)
+                        .focused($isPasswordFocused)
                 }
             }
             .navigationTitle("Connect")
+            .onAppear {
+                // Sheet presentation can steal first responder; queue focus for next run loop.
+                DispatchQueue.main.async {
+                    isPasswordFocused = true
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Connect") {
-                        dismiss()
-                        onConnect(password)
-                    }.disabled(password.isEmpty)
+                    Button("Connect", action: connect)
+                        .disabled(password.isEmpty)
                 }
             }
         }
+    }
+
+    private func connect() {
+        guard !password.isEmpty else { return }
+        dismiss()
+        onConnect(password)
     }
 }

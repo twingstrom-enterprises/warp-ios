@@ -223,6 +223,19 @@ const PTY_MODES: &[(russh::Pty, u32)] = &[
     (russh::Pty::ECHOE, 1),
 ];
 
+fn normalize_private_key_pem(raw_key: &str) -> String {
+    let mut key = raw_key.replace("\r\n", "\n").replace('\r', "\n");
+    if key.contains("\\n") && !key.contains('\n') {
+        key = key.replace("\\n", "\n");
+    }
+    let trimmed = key.trim().to_string();
+    if trimmed.ends_with('\n') {
+        trimmed
+    } else {
+        format!("{trimmed}\n")
+    }
+}
+
 impl SshSession {
     async fn configure_interactive_tty(channel: &russh::Channel<client::Msg>) {
         // Some servers ignore PTY mode flags sent during request_pty. Force the
@@ -287,8 +300,9 @@ impl SshSession {
             .await
             .map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
 
-        let key_pair = russh_keys::decode_secret_key(&private_key_pem, None)
-            .map_err(|_| SshError::InvalidKey)?;
+        let normalized_key = normalize_private_key_pem(&private_key_pem);
+        let key_pair =
+            russh_keys::decode_secret_key(&normalized_key, None).map_err(|_| SshError::InvalidKey)?;
 
         let authenticated = handle
             .authenticate_publickey(username, Arc::new(key_pair))
