@@ -214,10 +214,24 @@ async fn session_runner(
     let _ = handle.disconnect(russh::Disconnect::ByApplication, "", "English").await;
 }
 
-// Terminal modes: VERASE=0x7F so iOS's backspace key (DEL) erases characters.
-const PTY_MODES: &[(russh::Pty, u32)] = &[(russh::Pty::VERASE, 127)];
+// Terminal modes:
+// - VERASE=0x08 so iOS backspace can use classic ^H semantics.
+// - ECHO/ECHOE=1 so erased chars redraw immediately at an interactive prompt.
+const PTY_MODES: &[(russh::Pty, u32)] = &[
+    (russh::Pty::VERASE, 8),
+    (russh::Pty::ECHO, 1),
+    (russh::Pty::ECHOE, 1),
+];
 
 impl SshSession {
+    async fn configure_interactive_tty(channel: &russh::Channel<client::Msg>) {
+        // Some servers ignore PTY mode flags sent during request_pty. Force the
+        // interactive shell to use ^H erase with immediate visual backspace.
+        let _ = channel
+            .data(b"stty erase '^H' echo echoe 2>/dev/null\r".as_slice())
+            .await;
+    }
+
     async fn connect_with_password(
         host: String,
         port: u16,
@@ -251,6 +265,8 @@ impl SshSession {
             .request_shell(false)
             .await
             .map_err(|e| SshError::ChannelError(e.to_string()))?;
+
+        Self::configure_interactive_tty(&channel).await;
 
         let state = Arc::new(StdMutex::new(ReceiverState::Pending(Vec::new())));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -296,6 +312,8 @@ impl SshSession {
             .request_shell(false)
             .await
             .map_err(|e| SshError::ChannelError(e.to_string()))?;
+
+        Self::configure_interactive_tty(&channel).await;
 
         let state = Arc::new(StdMutex::new(ReceiverState::Pending(Vec::new())));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();

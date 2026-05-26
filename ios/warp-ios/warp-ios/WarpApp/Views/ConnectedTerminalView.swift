@@ -3,6 +3,7 @@ import SwiftUI
 struct ConnectedTerminalView: View {
     let host: SSHHost
     @State private var session = SSHSession()
+    @State private var accessoryState = AccessoryState()
     @State private var showPasswordPrompt = false
     @Environment(\.dismiss) private var dismiss
 
@@ -10,10 +11,13 @@ struct ConnectedTerminalView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             if session.isConnected {
-                TerminalView(session: session) {
-                    Task { await session.disconnect(); dismiss() }
-                }
+                TerminalView(session: session, accessoryState: accessoryState)
                 .ignoresSafeArea(edges: .bottom)
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    KeyAccessoryBar(session: session, accessoryState: accessoryState) {
+                        Task { await session.disconnect(); dismiss() }
+                    }
+                }
             } else if let error = session.errorMessage {
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle")

@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import SwiftTerm
+import UIKit
 
 @MainActor
 @Observable
@@ -9,7 +10,7 @@ class SSHSession {
     var errorMessage: String?
 
     private var rustSession: SshSession?
-    private weak var terminal: Terminal?
+    private weak var terminalView: SwiftTerm.TerminalView?
     // Last known terminal size; stored so we can sync it to the PTY right
     // after the connection is established (sizeChanged fires before connect).
     private var pendingCols: UInt16 = 0
@@ -38,13 +39,14 @@ class SSHSession {
                     privateKeyPem: pem
                 )
             }
-            if let terminal {
-                rustSession?.setReceiver(receiver: TerminalDataReceiver(terminal: terminal, session: self))
+            if let terminalView {
+                rustSession?.setReceiver(receiver: TerminalDataReceiver(terminalView: terminalView, session: self))
             }
             // Sync PTY size to what SwiftTerm actually rendered.
             // sizeChanged fires before the connection is up, so we apply the
             // stored dimensions now.  Fall back to terminal.cols/rows if
             // pendingCols was never set (e.g., first layout happened after connect).
+            let terminal = terminalView?.getTerminal()
             let cols = pendingCols > 0 ? pendingCols : UInt16(terminal?.cols ?? 80)
             let rows = pendingRows > 0 ? pendingRows : UInt16(terminal?.rows ?? 24)
             if cols > 0 && rows > 0 {
@@ -62,10 +64,10 @@ class SSHSession {
         rustSession = nil
     }
 
-    func attachTerminal(_ terminal: Terminal) {
-        self.terminal = terminal
+    func attachTerminalView(_ terminalView: SwiftTerm.TerminalView) {
+        self.terminalView = terminalView
         if let session = rustSession {
-            session.setReceiver(receiver: TerminalDataReceiver(terminal: terminal, session: self))
+            session.setReceiver(receiver: TerminalDataReceiver(terminalView: terminalView, session: self))
         }
     }
 
@@ -88,22 +90,30 @@ class SSHSession {
 }
 
 class TerminalDataReceiver: DataReceiver {
-    weak var terminal: Terminal?
+    weak var terminalView: SwiftTerm.TerminalView?
     weak var session: SSHSession?
 
-    init(terminal: Terminal?, session: SSHSession) {
-        self.terminal = terminal
+    init(terminalView: SwiftTerm.TerminalView?, session: SSHSession) {
+        self.terminalView = terminalView
         self.session = session
     }
 
     func onData(data: [UInt8]) {
-        // Always dispatch async to the main queue.  This ensures terminal.feed()
-        // is called AFTER SwiftTerm's sizeChanged() has fired and set the correct
-        // column/row count; feeding data before that causes 80-column line-wrap
-        // artifacts on narrow iPhone screens.
-        let terminal = terminal
-        DispatchQueue.main.async {
-            terminal?.feed(byteArray: data)
+        // Feed the TerminalView (not bare Terminal) so SwiftTerm runs feedPrepare/
+        // feedFinish and schedules display updates immediately.
+        terminalView?.feed(byteArray: data[...])
+
+        // Force a repaint when we receive erase-to-end-of-line traffic so stale
+        // glyphs do not linger visually after backspace.
+        let containsEraseControl = data.contains(0x08) && data.contains(0x4B)
+        if containsEraseControl, let terminalView {
+            if Thread.isMainThread {
+                terminalView.setNeedsDisplay(terminalView.bounds)
+            } else {
+                DispatchQueue.main.async {
+                    terminalView.setNeedsDisplay(terminalView.bounds)
+                }
+            }
         }
     }
 
