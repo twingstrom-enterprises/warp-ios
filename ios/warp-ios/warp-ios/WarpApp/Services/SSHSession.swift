@@ -115,11 +115,17 @@ class TerminalDataReceiver: DataReceiver {
         }
 
         // Rust callbacks arrive on a Tokio worker thread. SwiftTerm mutates
-        // UIKit state during feed(), so all terminal updates must run on main.
+        // UIKit state during feed(), so updates must run on main.
+        //
+        // SwiftTerm's iOS scroller can snap back to bottom when feed() runs
+        // while the user is actively dragging (UITrackingRunLoopMode). By
+        // scheduling feeds in .default mode, we let swipe scrollback win.
         if Thread.isMainThread {
-            applyDataToTerminal()
+            RunLoop.main.perform(inModes: [.default], block: applyDataToTerminal)
         } else {
-            DispatchQueue.main.async(execute: applyDataToTerminal)
+            DispatchQueue.main.async {
+                RunLoop.main.perform(inModes: [.default], block: applyDataToTerminal)
+            }
         }
     }
 
