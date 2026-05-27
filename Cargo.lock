@@ -15471,10 +15471,13 @@ name = "warp_ios_bridge"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex",
  "log",
  "once_cell",
  "russh",
  "russh-keys",
+ "serde",
+ "serde_json",
  "thiserror 2.0.17",
  "tokio",
  "uniffi",

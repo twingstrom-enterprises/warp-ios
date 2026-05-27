@@ -3,6 +3,7 @@ uniffi::include_scaffolding!("warp_ios_bridge");
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use russh::client::{self, Handle};
+use serde::Deserialize;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -66,6 +67,15 @@ pub trait DataReceiver: Send + Sync {
     fn on_disconnect(&self, reason: String);
 }
 
+pub trait SessionEventReceiver: Send + Sync {
+    fn on_bootstrapped(&self, shell: String, fallback_mode: bool);
+    fn on_preexec(&self, command: String, block_id: u64);
+    fn on_command_finished(&self, exit_code: i32, block_id: u64);
+    fn on_precmd(&self, working_directory: String);
+    fn on_output_chunk(&self, block_id: u64, data: Vec<u8>);
+    fn on_status(&self, message: String);
+}
+
 // Tracks whether a receiver has been registered yet.  Data that arrives
 // before set_receiver() is called is buffered so the initial shell prompt
 // is never lost.  Once on_disconnect fires the state moves to Disconnected
@@ -73,6 +83,12 @@ pub trait DataReceiver: Send + Sync {
 enum ReceiverState {
     Pending(Vec<Vec<u8>>),
     Active(Arc<dyn DataReceiver>),
+    Disconnected,
+}
+
+enum EventReceiverState {
+    Pending(Vec<SessionEvent>),
+    Active(Arc<dyn SessionEventReceiver>),
     Disconnected,
 }
 
@@ -87,7 +103,9 @@ pub struct SshSession {
     /// Sends outgoing commands to the runner task.
     cmd_tx: mpsc::UnboundedSender<SessionCmd>,
     /// Shared receiver state; also written by set_receiver() from Swift.
-    state: Arc<StdMutex<ReceiverState>>,
+    data_state: Arc<StdMutex<ReceiverState>>,
+    /// Shared event receiver state for block semantics updates.
+    event_state: Arc<StdMutex<EventReceiverState>>,
 }
 
 /// Minimal handler — we only need to accept the server's host key.
@@ -115,8 +133,12 @@ async fn session_runner(
     mut channel: russh::Channel<client::Msg>,
     handle: Handle<ClientHandler>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
-    state: Arc<StdMutex<ReceiverState>>,
+    data_state: Arc<StdMutex<ReceiverState>>,
+    event_state: Arc<StdMutex<EventReceiverState>>,
+    suppress_passthrough_until_bootstrapped: bool,
 ) {
+    let mut warp_state = WarpSessionState::default();
+    warp_state.suppress_passthrough_until_bootstrapped = suppress_passthrough_until_bootstrapped;
     let mut remote_closed = false;
 
     loop {
@@ -148,40 +170,21 @@ async fn session_runner(
                         break;
                     }
                     Some(russh::ChannelMsg::Data { ref data }) => {
-                        // Acquire lock only long enough to clone the receiver Arc.
-                        let data_vec = data.as_ref().to_vec();
-                        let rx_opt = {
-                            let mut st = state.lock().unwrap();
-                            match &mut *st {
-                                ReceiverState::Active(rx) => Some(Arc::clone(rx)),
-                                ReceiverState::Pending(buf) => {
-                                    buf.push(data_vec.clone());
-                                    None
-                                }
-                                ReceiverState::Disconnected => None,
-                            }
-                        };
-                        if let Some(rx) = rx_opt {
-                            rx.on_data(data_vec);
-                        }
+                        handle_incoming_bytes(
+                            data.as_ref().to_vec(),
+                            &data_state,
+                            &event_state,
+                            &mut warp_state,
+                        );
                     }
                     Some(russh::ChannelMsg::ExtendedData { ref data, .. }) => {
-                        // Stderr — surface it the same way as stdout.
-                        let data_vec = data.as_ref().to_vec();
-                        let rx_opt = {
-                            let mut st = state.lock().unwrap();
-                            match &mut *st {
-                                ReceiverState::Active(rx) => Some(Arc::clone(rx)),
-                                ReceiverState::Pending(buf) => {
-                                    buf.push(data_vec.clone());
-                                    None
-                                }
-                                ReceiverState::Disconnected => None,
-                            }
-                        };
-                        if let Some(rx) = rx_opt {
-                            rx.on_data(data_vec);
-                        }
+                        // Stderr uses the same parser path as stdout.
+                        handle_incoming_bytes(
+                            data.as_ref().to_vec(),
+                            &data_state,
+                            &event_state,
+                            &mut warp_state,
+                        );
                     }
                     // Server signals that the shell exited cleanly (user typed `exit`).
                     Some(russh::ChannelMsg::Eof) => {
@@ -201,13 +204,16 @@ async fn session_runner(
 
     // If the remote side closed the channel, tell Swift to dismiss the terminal.
     if remote_closed {
-        let mut st = state.lock().unwrap();
+        let mut st = data_state.lock().unwrap();
         if let ReceiverState::Active(rx) = &*st {
             rx.on_disconnect("session ended".to_string());
             *st = ReceiverState::Disconnected;
         } else {
             *st = ReceiverState::Disconnected;
         }
+
+        let mut event_st = event_state.lock().unwrap();
+        *event_st = EventReceiverState::Disconnected;
     }
 
     // Best-effort SSH-level disconnect (no-op if server already closed).
@@ -222,6 +228,332 @@ const PTY_MODES: &[(russh::Pty, u32)] = &[
     (russh::Pty::ECHO, 1),
     (russh::Pty::ECHOE, 1),
 ];
+
+#[derive(Clone)]
+enum SessionEvent {
+    Bootstrapped {
+        shell: String,
+        fallback_mode: bool,
+    },
+    Preexec {
+        command: String,
+        block_id: u64,
+    },
+    CommandFinished {
+        exit_code: i32,
+        block_id: u64,
+    },
+    Precmd {
+        working_directory: String,
+    },
+    OutputChunk {
+        block_id: u64,
+        data: Vec<u8>,
+    },
+    Status {
+        message: String,
+    },
+}
+
+impl SessionEvent {
+    fn emit(self, receiver: &dyn SessionEventReceiver) {
+        match self {
+            SessionEvent::Bootstrapped {
+                shell,
+                fallback_mode,
+            } => receiver.on_bootstrapped(shell, fallback_mode),
+            SessionEvent::Preexec { command, block_id } => receiver.on_preexec(command, block_id),
+            SessionEvent::CommandFinished {
+                exit_code,
+                block_id,
+            } => receiver.on_command_finished(exit_code, block_id),
+            SessionEvent::Precmd { working_directory } => receiver.on_precmd(working_directory),
+            SessionEvent::OutputChunk { block_id, data } => receiver.on_output_chunk(block_id, data),
+            SessionEvent::Status { message } => receiver.on_status(message),
+        }
+    }
+}
+
+struct WarpSessionState {
+    parser: OscHookParser,
+    next_block_id: u64,
+    current_block_id: Option<u64>,
+    suppress_passthrough_until_bootstrapped: bool,
+}
+
+impl Default for WarpSessionState {
+    fn default() -> Self {
+        Self {
+            parser: OscHookParser::default(),
+            next_block_id: 0,
+            current_block_id: None,
+            suppress_passthrough_until_bootstrapped: true,
+        }
+    }
+}
+
+#[derive(Default)]
+struct OscHookParser {
+    state: OscParseState,
+}
+
+enum OscParseState {
+    Normal,
+    Esc,
+    Osc {
+        payload: Vec<u8>,
+        esc_in_osc: bool,
+    },
+}
+
+impl Default for OscParseState {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "hook")]
+enum HookPayload {
+    Preexec {
+        command: String,
+    },
+    CommandFinished {
+        exit_code: i32,
+    },
+    Precmd {
+        #[serde(default)]
+        pwd: Option<String>,
+    },
+    Bootstrapped {
+        #[serde(default)]
+        shell: Option<String>,
+        #[serde(default)]
+        fallback_mode: bool,
+    },
+    Status {
+        message: String,
+    },
+}
+
+impl OscHookParser {
+    fn consume(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<HookPayload>) {
+        let mut passthrough = Vec::with_capacity(bytes.len());
+        let mut hooks = Vec::new();
+
+        for byte in bytes {
+            match &mut self.state {
+                OscParseState::Normal => {
+                    if *byte == 0x1B {
+                        self.state = OscParseState::Esc;
+                    } else {
+                        passthrough.push(*byte);
+                    }
+                }
+                OscParseState::Esc => {
+                    if *byte == b']' {
+                        self.state = OscParseState::Osc {
+                            payload: Vec::new(),
+                            esc_in_osc: false,
+                        };
+                    } else {
+                        passthrough.push(0x1B);
+                        passthrough.push(*byte);
+                        self.state = OscParseState::Normal;
+                    }
+                }
+                OscParseState::Osc {
+                    payload,
+                    esc_in_osc,
+                } => {
+                    if *esc_in_osc {
+                        if *byte == b'\\' {
+                            Self::finish_osc(payload, true, &mut passthrough, &mut hooks);
+                            self.state = OscParseState::Normal;
+                        } else {
+                            payload.push(0x1B);
+                            payload.push(*byte);
+                            *esc_in_osc = *byte == 0x1B;
+                        }
+                    } else if *byte == 0x07 {
+                        Self::finish_osc(payload, false, &mut passthrough, &mut hooks);
+                        self.state = OscParseState::Normal;
+                    } else if *byte == 0x1B {
+                        *esc_in_osc = true;
+                    } else {
+                        payload.push(*byte);
+                    }
+                }
+            }
+        }
+
+        (passthrough, hooks)
+    }
+
+    fn finish_osc(
+        payload: &[u8],
+        terminated_by_st: bool,
+        passthrough: &mut Vec<u8>,
+        hooks: &mut Vec<HookPayload>,
+    ) {
+        let Some(payload_string) = std::str::from_utf8(payload).ok() else {
+            passthrough.extend_from_slice(&encode_original_osc(payload, terminated_by_st));
+            return;
+        };
+
+        let Some(encoded_hook_payload) = payload_string.strip_prefix("9278;") else {
+            passthrough.extend_from_slice(&encode_original_osc(payload, terminated_by_st));
+            return;
+        };
+
+        if let Some(hook) = parse_hook_payload(encoded_hook_payload) {
+            hooks.push(hook);
+        }
+    }
+}
+
+fn parse_hook_payload(payload: &str) -> Option<HookPayload> {
+    let as_json_bytes = if is_hex_payload(payload) {
+        hex::decode(payload).ok()?
+    } else {
+        payload.as_bytes().to_vec()
+    };
+
+    serde_json::from_slice::<HookPayload>(&as_json_bytes).ok()
+}
+
+fn is_hex_payload(payload: &str) -> bool {
+    payload.len() % 2 == 0
+        && payload
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn encode_original_osc(payload: &[u8], terminated_by_st: bool) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(payload.len() + 5);
+    encoded.extend_from_slice(&[0x1B, b']']);
+    encoded.extend_from_slice(payload);
+    if terminated_by_st {
+        encoded.extend_from_slice(&[0x1B, b'\\']);
+    } else {
+        encoded.push(0x07);
+    }
+    encoded
+}
+
+fn handle_incoming_bytes(
+    data: Vec<u8>,
+    data_state: &Arc<StdMutex<ReceiverState>>,
+    event_state: &Arc<StdMutex<EventReceiverState>>,
+    warp_state: &mut WarpSessionState,
+) {
+    let (passthrough, hooks) = warp_state.parser.consume(&data);
+
+    for hook in hooks {
+        match hook {
+            HookPayload::Preexec { command } => {
+                let block_id = warp_state.next_block_id;
+                warp_state.next_block_id = warp_state.next_block_id.saturating_add(1);
+                warp_state.current_block_id = Some(block_id);
+                dispatch_event(event_state, SessionEvent::Preexec { command, block_id });
+            }
+            HookPayload::CommandFinished { exit_code } => {
+                let block_id = warp_state.current_block_id.unwrap_or_default();
+                dispatch_event(
+                    event_state,
+                    SessionEvent::CommandFinished {
+                        exit_code,
+                        block_id,
+                    },
+                );
+                warp_state.current_block_id = None;
+            }
+            HookPayload::Precmd { pwd } => {
+                dispatch_event(
+                    event_state,
+                    SessionEvent::Precmd {
+                        working_directory: pwd.unwrap_or_default(),
+                    },
+                );
+            }
+            HookPayload::Bootstrapped {
+                shell,
+                fallback_mode,
+            } => {
+                warp_state.suppress_passthrough_until_bootstrapped = false;
+                dispatch_event(
+                    event_state,
+                    SessionEvent::Bootstrapped {
+                        shell: shell.unwrap_or_else(|| "unknown".to_string()),
+                        fallback_mode,
+                    },
+                )
+            }
+            HookPayload::Status { message } => {
+                dispatch_event(event_state, SessionEvent::Status { message });
+            }
+        }
+    }
+
+    if let Some(block_id) = warp_state.current_block_id {
+        if !passthrough.is_empty() {
+            dispatch_event(
+                event_state,
+                SessionEvent::OutputChunk {
+                    block_id,
+                    data: passthrough.clone(),
+                },
+            );
+        }
+    }
+
+    let should_forward_to_prompt_terminal =
+        !warp_state.suppress_passthrough_until_bootstrapped && warp_state.current_block_id.is_none();
+
+    if passthrough.is_empty() || !should_forward_to_prompt_terminal {
+        return;
+    }
+
+    let rx_opt = {
+        let mut st = data_state.lock().unwrap();
+        match &mut *st {
+            ReceiverState::Active(rx) => Some(Arc::clone(rx)),
+            ReceiverState::Pending(buf) => {
+                buf.push(passthrough.clone());
+                None
+            }
+            ReceiverState::Disconnected => None,
+        }
+    };
+
+    if let Some(rx) = rx_opt {
+        rx.on_data(passthrough);
+    }
+}
+
+fn dispatch_event(event_state: &Arc<StdMutex<EventReceiverState>>, event: SessionEvent) {
+    let event_for_buffer = event.clone();
+    let receiver_opt = {
+        let mut st = event_state.lock().unwrap();
+        match &mut *st {
+            EventReceiverState::Active(receiver) => Some(Arc::clone(receiver)),
+            EventReceiverState::Pending(buffer) => {
+                // Avoid unbounded memory growth if Swift is not yet attached.
+                match event_for_buffer {
+                    SessionEvent::OutputChunk { .. } => {}
+                    _ => buffer.push(event_for_buffer),
+                }
+                None
+            }
+            EventReceiverState::Disconnected => None,
+        }
+    };
+
+    if let Some(receiver) = receiver_opt {
+        event.emit(receiver.as_ref());
+    }
+}
 
 fn normalize_private_key_pem(raw_key: &str) -> String {
     let mut key = raw_key.replace("\r\n", "\n").replace('\r', "\n");
@@ -243,6 +575,10 @@ impl SshSession {
         let _ = channel
             .data(b"stty erase '^H' echo echoe 2>/dev/null\r".as_slice())
             .await;
+    }
+
+    async fn install_warp_hooks(channel: &russh::Channel<client::Msg>) -> bool {
+        channel.data(WARP_HOOK_BOOTSTRAP_SCRIPT.as_bytes()).await.is_ok()
     }
 
     async fn connect_with_password(
@@ -280,13 +616,41 @@ impl SshSession {
             .map_err(|e| SshError::ChannelError(e.to_string()))?;
 
         Self::configure_interactive_tty(&channel).await;
-
-        let state = Arc::new(StdMutex::new(ReceiverState::Pending(Vec::new())));
+        let data_state = Arc::new(StdMutex::new(ReceiverState::Pending(Vec::new())));
+        let event_state = Arc::new(StdMutex::new(EventReceiverState::Pending(Vec::new())));
+        let bootstrap_ok = Self::install_warp_hooks(&channel).await;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        RUNTIME.spawn(session_runner(channel, handle, cmd_rx, Arc::clone(&state)));
+        RUNTIME.spawn(session_runner(
+            channel,
+            handle,
+            cmd_rx,
+            Arc::clone(&data_state),
+            Arc::clone(&event_state),
+            bootstrap_ok,
+        ));
 
-        Ok(Arc::new(SshSession { cmd_tx, state }))
+        if !bootstrap_ok {
+            dispatch_event(
+                &event_state,
+                SessionEvent::Status {
+                    message: "failed to install warp shell hooks; using raw mode".to_string(),
+                },
+            );
+            dispatch_event(
+                &event_state,
+                SessionEvent::Bootstrapped {
+                    shell: "unknown".to_string(),
+                    fallback_mode: true,
+                },
+            );
+        }
+
+        Ok(Arc::new(SshSession {
+            cmd_tx,
+            data_state,
+            event_state,
+        }))
     }
 
     async fn connect_with_key(
@@ -328,13 +692,41 @@ impl SshSession {
             .map_err(|e| SshError::ChannelError(e.to_string()))?;
 
         Self::configure_interactive_tty(&channel).await;
-
-        let state = Arc::new(StdMutex::new(ReceiverState::Pending(Vec::new())));
+        let data_state = Arc::new(StdMutex::new(ReceiverState::Pending(Vec::new())));
+        let event_state = Arc::new(StdMutex::new(EventReceiverState::Pending(Vec::new())));
+        let bootstrap_ok = Self::install_warp_hooks(&channel).await;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        RUNTIME.spawn(session_runner(channel, handle, cmd_rx, Arc::clone(&state)));
+        RUNTIME.spawn(session_runner(
+            channel,
+            handle,
+            cmd_rx,
+            Arc::clone(&data_state),
+            Arc::clone(&event_state),
+            bootstrap_ok,
+        ));
 
-        Ok(Arc::new(SshSession { cmd_tx, state }))
+        if !bootstrap_ok {
+            dispatch_event(
+                &event_state,
+                SessionEvent::Status {
+                    message: "failed to install warp shell hooks; using raw mode".to_string(),
+                },
+            );
+            dispatch_event(
+                &event_state,
+                SessionEvent::Bootstrapped {
+                    shell: "unknown".to_string(),
+                    fallback_mode: true,
+                },
+            );
+        }
+
+        Ok(Arc::new(SshSession {
+            cmd_tx,
+            data_state,
+            event_state,
+        }))
     }
 
     // send_data / resize just push to the mpsc — they return instantly.
@@ -350,7 +742,7 @@ impl SshSession {
 
     pub fn set_receiver(&self, receiver: Box<dyn DataReceiver>) {
         let arc_receiver: Arc<dyn DataReceiver> = Arc::from(receiver);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.data_state.lock().unwrap();
         // Atomically drain the pending buffer and activate the receiver so no
         // data packet falls into the gap between draining and activating.
         // If already Disconnected (e.g. instant server rejection), skip.
@@ -368,14 +760,147 @@ impl SshSession {
         }
     }
 
+    pub fn set_event_receiver(&self, receiver: Box<dyn SessionEventReceiver>) {
+        let arc_receiver: Arc<dyn SessionEventReceiver> = Arc::from(receiver);
+        let mut state = self.event_state.lock().unwrap();
+        match &*state {
+            EventReceiverState::Pending(buffer) => {
+                for event in buffer.iter().cloned() {
+                    event.emit(arc_receiver.as_ref());
+                }
+                *state = EventReceiverState::Active(arc_receiver);
+            }
+            EventReceiverState::Active(_) => {
+                *state = EventReceiverState::Active(arc_receiver);
+            }
+            EventReceiverState::Disconnected => {}
+        }
+    }
+
     pub async fn disconnect(&self) {
         // Mark Disconnected first so the runner doesn't also fire on_disconnect
         // if it happens to see remote EOF at the same moment.
         {
-            let mut state = self.state.lock().unwrap();
-            *state = ReceiverState::Disconnected;
+            let mut data_state = self.data_state.lock().unwrap();
+            *data_state = ReceiverState::Disconnected;
+        }
+        {
+            let mut event_state = self.event_state.lock().unwrap();
+            *event_state = EventReceiverState::Disconnected;
         }
         // Signal the runner to close the SSH connection and exit.
         let _ = self.cmd_tx.send(SessionCmd::Disconnect);
+    }
+}
+
+const WARP_HOOK_BOOTSTRAP_SCRIPT: &str = r#"__warp_ios_emit() { printf '\033]9278;%s\007' "$1"; }
+__warp_ios_ready=0
+__warp_ios_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/}
+  printf '%s' "$value"
+}
+__warp_ios_emit_preexec() {
+  [ "$__warp_ios_ready" = "1" ] || return
+  local raw_cmd="$1"
+  local escaped_cmd
+  escaped_cmd="$(__warp_ios_escape "$raw_cmd")"
+  [ -z "$escaped_cmd" ] && return
+  __warp_ios_emit "{\"hook\":\"Preexec\",\"command\":\"$escaped_cmd\"}"
+}
+__warp_ios_emit_precmd() {
+  [ "$__warp_ios_ready" = "1" ] || return
+  local status="$1"
+  local escaped_pwd
+  escaped_pwd="$(__warp_ios_escape "$PWD")"
+  __warp_ios_emit "{\"hook\":\"CommandFinished\",\"exit_code\":$status}"
+  __warp_ios_emit "{\"hook\":\"Precmd\",\"pwd\":\"$escaped_pwd\"}"
+}
+if [ -n "${ZSH_VERSION:-}" ]; then
+  __warp_ios_preexec_zsh() {
+    __warp_ios_emit_preexec "$1"
+  }
+  __warp_ios_precmd_zsh() {
+    local status=$?
+    __warp_ios_emit_precmd "$status"
+  }
+  autoload -Uz add-zsh-hook >/dev/null 2>&1 || true
+  add-zsh-hook preexec __warp_ios_preexec_zsh >/dev/null 2>&1 || true
+  add-zsh-hook precmd __warp_ios_precmd_zsh >/dev/null 2>&1 || true
+  __warp_ios_emit '{"hook":"Bootstrapped","shell":"zsh"}'
+  __warp_ios_ready=1
+elif [ -n "${BASH_VERSION:-}" ]; then
+  __warp_ios_in_prompt=0
+  __warp_ios_preexec_bash() {
+    [ "$__warp_ios_in_prompt" = "1" ] && return
+    case "$BASH_COMMAND" in
+      __warp_ios_emit*|__warp_ios_escape*|__warp_ios_preexec_bash*|__warp_ios_precmd_bash*|history*|trap*|PROMPT_COMMAND*) return ;;
+    esac
+    __warp_ios_emit_preexec "$BASH_COMMAND"
+  }
+  __warp_ios_precmd_bash() {
+    local status=$?
+    __warp_ios_in_prompt=1
+    __warp_ios_emit_precmd "$status"
+    __warp_ios_in_prompt=0
+  }
+  trap '__warp_ios_preexec_bash' DEBUG
+  case ";${PROMPT_COMMAND};" in
+    *";__warp_ios_precmd_bash;"*) ;;
+    *) PROMPT_COMMAND="__warp_ios_precmd_bash${PROMPT_COMMAND:+;${PROMPT_COMMAND}}" ;;
+  esac
+  __warp_ios_emit '{"hook":"Bootstrapped","shell":"bash"}'
+  __warp_ios_ready=1
+else
+  __warp_ios_emit '{"hook":"Bootstrapped","shell":"unknown","fallback_mode":true}'
+  __warp_ios_emit '{"hook":"Status","message":"warp hooks unavailable for current shell"}'
+fi
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::{HookPayload, OscHookParser};
+
+    #[test]
+    fn parses_plain_osc_hook_and_keeps_display_bytes() {
+        let mut parser = OscHookParser::default();
+        let input = b"before\x1b]9278;{\"hook\":\"Preexec\",\"command\":\"ls -la\"}\x07after";
+
+        let (display, hooks) = parser.consume(input);
+
+        assert_eq!(display, b"beforeafter");
+        assert_eq!(
+            hooks,
+            vec![HookPayload::Preexec {
+                command: "ls -la".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_hex_encoded_payload() {
+        let mut parser = OscHookParser::default();
+        let input = b"\x1b]9278;7b22686f6f6b223a22436f6d6d616e6446696e6973686564222c22657869745f636f6465223a317d\x07";
+
+        let (_display, hooks) = parser.consume(input);
+
+        assert_eq!(
+            hooks,
+            vec![HookPayload::CommandFinished { exit_code: 1 }]
+        );
+    }
+
+    #[test]
+    fn passes_through_non_warp_osc_sequences() {
+        let mut parser = OscHookParser::default();
+        let input = b"ab\x1b]0;title\x07cd";
+
+        let (display, hooks) = parser.consume(input);
+
+        assert_eq!(display, input);
+        assert!(hooks.is_empty());
     }
 }

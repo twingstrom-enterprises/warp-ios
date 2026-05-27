@@ -1,45 +1,108 @@
 import SwiftUI
+import UIKit
 
 struct ConnectedTerminalView: View {
     let host: SSHHost
     @State private var session = SSHSession()
     @State private var accessoryState = AccessoryState()
-    @State private var showsJumpToBottom = false
     @State private var jumpToBottomRequest = 0
     @State private var showPasswordPrompt = false
     @State private var didSubmitPassword = false
     @Environment(\.dismiss) private var dismiss
+    
+    private var deviceTypeName: String {
+        switch UIDevice.current.userInterfaceIdiom {
+        case .pad:
+            return "iPad"
+        case .phone:
+            return "iPhone"
+        default:
+            return "iOS"
+        }
+    }
+
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if session.isConnected {
-                ZStack(alignment: .bottomTrailing) {
+                if session.blockStore.fallbackModeEnabled || !session.blockStore.isBootstrapped {
                     TerminalView(
                         session: session,
                         accessoryState: accessoryState,
-                        showsJumpToBottom: $showsJumpToBottom,
-                        jumpToBottomRequest: jumpToBottomRequest
+                        showsJumpToBottom: .constant(false),
+                        jumpToBottomRequest: 0
                     )
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         KeyAccessoryBar(session: session, accessoryState: accessoryState) {
                             Task { await session.disconnect(); dismiss() }
                         }
                     }
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 10) {
+                                if let status = session.blockStore.statusMessage {
+                                    Text(status)
+                                        .font(.caption)
+                                        .foregroundStyle(.yellow)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
 
-                    if showsJumpToBottom {
-                        Button {
-                            jumpToBottomRequest &+= 1
-                        } label: {
-                            Label("Bottom", systemImage: "arrow.down.to.line.compact")
-                                .font(.caption.weight(.semibold))
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
+                                if session.blockStore.blocks.isEmpty {
+                                    Text("Welcome to Warp for \(deviceTypeName)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    ForEach(session.blockStore.blocks) { block in
+                                        BlockRowView(block: block) {
+                                            UIPasteboard.general.string = session.blockStore.copyText(for: block.id)
+                                        }
+                                        .id(block.id)
+                                    }
+                                }
+
+                                TerminalView(
+                                    session: session,
+                                    accessoryState: accessoryState,
+                                    showsJumpToBottom: .constant(false),
+                                    jumpToBottomRequest: 0
+                                )
+                                .frame(height: 120)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .id("promptAnchor")
+                            }
+                            .padding(12)
                         }
-                        .foregroundStyle(.white)
-                        .background(Color.white.opacity(0.18), in: Capsule())
-                        .padding(.trailing, 12)
-                        .padding(.bottom, 56)
+                        .onChange(of: jumpToBottomRequest) { _, _ in
+                            withAnimation {
+                                proxy.scrollTo("promptAnchor", anchor: .bottom)
+                            }
+                        }
+                        .onChange(of: session.blockStore.scrollTick) { _, _ in
+                            withAnimation(.linear(duration: 0.06)) {
+                                proxy.scrollTo("promptAnchor", anchor: .bottom)
+                            }
+                        }
+                        .overlay(alignment: .bottomTrailing) {
+                            Button {
+                                jumpToBottomRequest &+= 1
+                            } label: {
+                                Label("Bottom", systemImage: "arrow.down.to.line.compact")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                            }
+                            .foregroundStyle(.white)
+                            .background(Color.white.opacity(0.16), in: Capsule())
+                            .padding(.trailing, 10)
+                            .padding(.bottom, 8)
+                        }
+                    }
+                    .safeAreaInset(edge: .bottom, spacing: 0) {
+                        KeyAccessoryBar(session: session, accessoryState: accessoryState) {
+                            Task { await session.disconnect(); dismiss() }
+                        }
                     }
                 }
             } else if let error = session.errorMessage {
