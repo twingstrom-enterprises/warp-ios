@@ -24,10 +24,20 @@ callback interface DataReceiver {
     void on_disconnect(string reason);
 };
 
+callback interface SessionEventReceiver {
+    void on_bootstrapped(string shell, boolean fallback_mode);
+    void on_preexec(string command, u64 block_id);
+    void on_command_finished(i32 exit_code, u64 block_id);
+    void on_precmd(string working_directory);
+    void on_output_chunk(u64 block_id, sequence<u8> data);
+    void on_status(string message);
+};
+
 interface SshSession {
     void send_data(sequence<u8> data);
     void resize(u16 cols, u16 rows);
     void set_receiver(DataReceiver receiver);
+    void set_event_receiver(SessionEventReceiver receiver);
 
     [Async]
     void disconnect();
