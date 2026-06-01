@@ -378,6 +378,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai_terminal_runtime"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "aliasable"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15470,6 +15478,7 @@ dependencies = [
 name = "warp_ios_bridge"
 version = "0.1.0"
 dependencies = [
+ "ai_terminal_runtime",
  "async-trait",
  "hex",
  "log",

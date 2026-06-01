@@ -10,6 +10,8 @@ class AccessoryState {
 struct KeyAccessoryBar: View {
     var session: SSHSession
     var accessoryState: AccessoryState
+    @Binding var inputRoutingMode: InputRoutingMode
+    var aiToolsEnabled: Bool
     /// Called when the user taps the disconnect (home) button.
     var onDisconnect: () -> Void
 
@@ -24,6 +26,16 @@ struct KeyAccessoryBar: View {
 
     var body: some View {
         HStack(spacing: 2) {
+            if aiToolsEnabled {
+                Picker("Mode", selection: $inputRoutingMode) {
+                    ForEach(InputRoutingMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 150)
+            }
+
             Button {
                 accessoryState.ctrlActive.toggle()
             } label: {

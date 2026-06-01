@@ -27,6 +27,7 @@ callback interface DataReceiver {
 callback interface SessionEventReceiver {
     void on_bootstrapped(string shell, boolean fallback_mode);
     void on_preexec(string command, u64 block_id);
+    void on_ai_preexec(string command, u64 block_id, string metadata_json);
     void on_command_finished(i32 exit_code, u64 block_id);
     void on_precmd(string working_directory);
     void on_output_chunk(u64 block_id, sequence<u8> data);
@@ -36,6 +37,13 @@ callback interface SessionEventReceiver {
 
 interface SshSession {
     void send_data(sequence<u8> data);
+    [Throws=SshError, Async]
+    u64 execute_command(string command, string metadata_json);
+    [Throws=SshError, Async]
+    string await_command_completion(u64 block_id, u32 timeout_ms);
+    string read_command_output(u64 block_id);
+    void write_to_running_command(u64 block_id, sequence<u8> data);
+    void cancel_running_command(u64 block_id);
     void request_history(u32 limit);
     void resize(u16 cols, u16 rows);
     void set_receiver(DataReceiver receiver);

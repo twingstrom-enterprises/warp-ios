@@ -8,6 +8,7 @@ struct ConnectedTerminalView: View {
     @State private var jumpToBottomRequest = 0
     @State private var showPasswordPrompt = false
     @State private var didSubmitPassword = false
+    @FocusState private var isAIPromptFocused: Bool
     @Environment(\.dismiss) private var dismiss
     
     private var deviceTypeName: String {
@@ -150,11 +151,119 @@ struct ConnectedTerminalView: View {
                 await session.connect(host: host)
             }
         }
+        .onChange(of: session.inputRoutingMode) { _, mode in
+            guard session.aiToolsEnabled else { return }
+            if mode == .ai {
+                session.relinquishTerminalFocusForAI()
+                DispatchQueue.main.async {
+                    isAIPromptFocused = true
+                }
+            } else {
+                isAIPromptFocused = false
+                session.focusTerminalIfNeeded()
+            }
+        }
+        .onChange(of: session.isConnected) { _, isNowConnected in
+            guard isNowConnected, session.aiToolsEnabled, session.inputRoutingMode == .ai else { return }
+            session.relinquishTerminalFocusForAI()
+            DispatchQueue.main.async {
+                isAIPromptFocused = true
+            }
+        }
     }
 
     @ViewBuilder
     private var accessoryArea: some View {
         VStack(spacing: 0) {
+            if session.aiToolsEnabled, session.inputRoutingMode == .ai {
+                VStack(spacing: 6) {
+                    if session.aiIsThinking {
+                        TimelineView(.animation(minimumInterval: 0.35)) { timeline in
+                            let phase = Int(timeline.date.timeIntervalSinceReferenceDate * 2.85) % 4
+                            let dots = String(repeating: ".", count: phase)
+                            HStack {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "sparkles")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(Color.purple.opacity(0.95))
+                                    Text("Warping\(dots)")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(Color.purple.opacity(0.95))
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(
+                                    Capsule()
+                                        .fill(Color.purple.opacity(0.16))
+                                )
+
+                                Text("thinking through your prompt")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+
+                                Spacer()
+                            }
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+
+                    if let pending = session.pendingAICommandSuggestion {
+                        HStack(spacing: 8) {
+                            Text("AI suggests: `\(pending.command)`")
+                                .font(.caption)
+                                .lineLimit(2)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Button("Cancel") {
+                                session.dismissPendingAICommandSuggestion()
+                            }
+                            .font(.caption.weight(.semibold))
+
+                            Button("Run") {
+                                Task { await session.approvePendingAICommandSuggestion() }
+                            }
+                            .font(.caption.weight(.semibold))
+                            .disabled(session.aiIsThinking)
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        TextField("Ask AI or use run <command> / !<command>", text: $session.aiPromptDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.callout, design: .monospaced))
+                            .submitLabel(.send)
+                            .focused($isAIPromptFocused)
+                            .onSubmit {
+                                Task { await session.submitAIPrompt() }
+                            }
+                            .disabled(session.aiIsThinking)
+
+                        if session.isWarpLoggedIn {
+                            Button("Logout") {
+                                session.logoutFromWarp()
+                            }
+                            .font(.caption.weight(.semibold))
+                        } else {
+                            Button("Login") {
+                                Task { await session.loginToWarp() }
+                            }
+                            .font(.caption.weight(.semibold))
+                        }
+
+                        Button("Send") {
+                            Task { await session.submitAIPrompt() }
+                        }
+                        .disabled(
+                            session.aiIsThinking
+                                || session.aiPromptDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        )
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Color(UIColor.systemGray6))
+            }
+
             if session.richHistoryVisible {
                 RichHistoryMenuView(
                     items: session.richHistoryItems,
@@ -163,7 +272,12 @@ struct ConnectedTerminalView: View {
                 )
             }
 
-            KeyAccessoryBar(session: session, accessoryState: accessoryState) {
+            KeyAccessoryBar(
+                session: session,
+                accessoryState: accessoryState,
+                inputRoutingMode: $session.inputRoutingMode,
+                aiToolsEnabled: session.aiToolsEnabled
+            ) {
                 Task { await session.disconnect(); dismiss() }
             }
         }

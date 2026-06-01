@@ -27,6 +27,15 @@ final class WarpSessionController: SessionEventReceiver {
         }
     }
 
+    func onAiPreexec(command: String, blockId: UInt64, metadataJson: String) {
+        DispatchQueue.main.async { [store, session] in
+            let metadata = Self.decodeMetadata(from: metadataJson)
+            session.trace("hook ai_preexec block=\(blockId) command='\(command)' metadata=\(metadataJson)")
+            store.applyPreexec(command: command, blockId: blockId, metadata: metadata)
+            session.handlePreexecEvent()
+        }
+    }
+
     func onCommandFinished(exitCode: Int32, blockId: UInt64) {
         DispatchQueue.main.async { [store, session] in
             session.trace("hook command_finished block=\(blockId) exit=\(exitCode)")
@@ -63,5 +72,10 @@ final class WarpSessionController: SessionEventReceiver {
         DispatchQueue.main.async { [store] in
             store.applyStatus(message)
         }
+    }
+
+    private static func decodeMetadata(from raw: String) -> CommandExecutionMetadata? {
+        guard let data = raw.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(CommandExecutionMetadata.self, from: data)
     }
 }
