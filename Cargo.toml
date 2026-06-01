@@ -29,6 +29,7 @@ publish = false
 
 [workspace.dependencies]
 # Local workspace crates. This lets us reference them in other crates without specifying a path.
+ai_terminal_runtime = { path = "crates/ai_terminal_runtime" }
 warp_ios_bridge = { path = "crates/warp_ios_bridge" }
 ai = { path = "crates/ai" }
 app-installation-detection = { path = "crates/app-installation-detection" }

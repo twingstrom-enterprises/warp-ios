@@ -1,12 +1,15 @@
 uniffi::include_scaffolding!("warp_ios_bridge");
 
+use ai_terminal_runtime::{CommandExecutionMetadata, CommandRegistry, ExecutionSource};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use russh::client::{self, Handle};
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 // Single global multi-thread Tokio runtime.  UniFFI 0.28's tokio feature only
 // provides waker bridging — it does NOT start a reactor.  All async SSH work
@@ -77,6 +80,7 @@ pub trait DataReceiver: Send + Sync {
 pub trait SessionEventReceiver: Send + Sync {
     fn on_bootstrapped(&self, shell: String, fallback_mode: bool);
     fn on_preexec(&self, command: String, block_id: u64);
+    fn on_ai_preexec(&self, command: String, block_id: u64, metadata_json: String);
     fn on_command_finished(&self, exit_code: i32, block_id: u64);
     fn on_precmd(&self, working_directory: String);
     fn on_output_chunk(&self, block_id: u64, data: Vec<u8>);
@@ -103,6 +107,18 @@ enum EventReceiverState {
 /// Commands sent from Swift → session_runner over an mpsc channel.
 enum SessionCmd {
     Data(Vec<u8>),
+    ExecuteCommand {
+        command: String,
+        metadata: CommandExecutionMetadata,
+        response: oneshot::Sender<Result<u64, SshError>>,
+    },
+    WriteToRunningCommand {
+        block_id: u64,
+        data: Vec<u8>,
+    },
+    CancelRunningCommand {
+        block_id: u64,
+    },
     RequestHistory(u32),
     Resize(u16, u16),
     Disconnect,
@@ -115,6 +131,8 @@ pub struct SshSession {
     data_state: Arc<StdMutex<ReceiverState>>,
     /// Shared event receiver state for block semantics updates.
     event_state: Arc<StdMutex<EventReceiverState>>,
+    /// Command lifecycle model shared with iOS AI orchestration.
+    command_registry: CommandRegistry,
 }
 
 /// Minimal handler — we only need to accept the server's host key.
@@ -144,6 +162,7 @@ async fn session_runner(
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     data_state: Arc<StdMutex<ReceiverState>>,
     event_state: Arc<StdMutex<EventReceiverState>>,
+    command_registry: CommandRegistry,
     suppress_passthrough_until_bootstrapped: bool,
 ) {
     let mut warp_state = WarpSessionState::default();
@@ -159,6 +178,47 @@ async fn session_runner(
                     Some(SessionCmd::Data(data)) => {
                         if channel.data(data.as_slice()).await.is_err() {
                             // Send failed — channel is already closed by the server.
+                            remote_closed = true;
+                            break;
+                        }
+                    }
+                    Some(SessionCmd::ExecuteCommand {
+                        command,
+                        metadata,
+                        response,
+                    }) => {
+                        let command = command.trim().to_string();
+                        if command.is_empty() {
+                            let _ = response.send(Err(SshError::ChannelError(
+                                "cannot execute empty command".to_string(),
+                            )));
+                            continue;
+                        }
+                        let mut bytes = command.clone().into_bytes();
+                        bytes.push(b'\r');
+                        if channel.data(bytes.as_slice()).await.is_err() {
+                            let _ = response.send(Err(SshError::Disconnected));
+                            remote_closed = true;
+                            break;
+                        }
+                        warp_state.pending_ai_exec_requests.push_back(PendingAIExecution {
+                            command,
+                            metadata,
+                            response,
+                        });
+                    }
+                    Some(SessionCmd::WriteToRunningCommand { block_id, data }) => {
+                        if warp_state.current_block_id == Some(block_id)
+                            && channel.data(data.as_slice()).await.is_err()
+                        {
+                            remote_closed = true;
+                            break;
+                        }
+                    }
+                    Some(SessionCmd::CancelRunningCommand { block_id }) => {
+                        if warp_state.current_block_id == Some(block_id)
+                            && channel.data([0x03].as_slice()).await.is_err()
+                        {
                             remote_closed = true;
                             break;
                         }
@@ -191,6 +251,7 @@ async fn session_runner(
                             &data_state,
                             &event_state,
                             &mut warp_state,
+                            &command_registry,
                         );
                     }
                     Some(russh::ChannelMsg::ExtendedData { ref data, .. }) => {
@@ -200,6 +261,7 @@ async fn session_runner(
                             &data_state,
                             &event_state,
                             &mut warp_state,
+                            &command_registry,
                         );
                     }
                     // Server signals that the shell exited cleanly (user typed `exit`).
@@ -216,6 +278,10 @@ async fn session_runner(
                 }
             }
         }
+    }
+
+    while let Some(pending) = warp_state.pending_ai_exec_requests.pop_front() {
+        let _ = pending.response.send(Err(SshError::Disconnected));
     }
 
     // If the remote side closed the channel, tell Swift to dismiss the terminal.
@@ -251,6 +317,11 @@ const PTY_MODES: &[(russh::Pty, u32)] = &[
 enum SessionEvent {
     Bootstrapped { shell: String, fallback_mode: bool },
     Preexec { command: String, block_id: u64 },
+    AIPreexec {
+        command: String,
+        block_id: u64,
+        metadata_json: String,
+    },
     CommandFinished { exit_code: i32, block_id: u64 },
     Precmd { working_directory: String },
     OutputChunk { block_id: u64, data: Vec<u8> },
@@ -266,6 +337,11 @@ impl SessionEvent {
                 fallback_mode,
             } => receiver.on_bootstrapped(shell, fallback_mode),
             SessionEvent::Preexec { command, block_id } => receiver.on_preexec(command, block_id),
+            SessionEvent::AIPreexec {
+                command,
+                block_id,
+                metadata_json,
+            } => receiver.on_ai_preexec(command, block_id, metadata_json),
             SessionEvent::CommandFinished {
                 exit_code,
                 block_id,
@@ -285,6 +361,14 @@ struct WarpSessionState {
     next_block_id: u64,
     current_block_id: Option<u64>,
     suppress_passthrough_until_bootstrapped: bool,
+    pending_ai_exec_requests: VecDeque<PendingAIExecution>,
+    active_metadata: Option<CommandExecutionMetadata>,
+}
+
+struct PendingAIExecution {
+    command: String,
+    metadata: CommandExecutionMetadata,
+    response: oneshot::Sender<Result<u64, SshError>>,
 }
 
 impl Default for WarpSessionState {
@@ -294,6 +378,8 @@ impl Default for WarpSessionState {
             next_block_id: 0,
             current_block_id: None,
             suppress_passthrough_until_bootstrapped: true,
+            pending_ai_exec_requests: VecDeque::new(),
+            active_metadata: None,
         }
     }
 }
@@ -453,6 +539,7 @@ fn handle_incoming_bytes(
     data_state: &Arc<StdMutex<ReceiverState>>,
     event_state: &Arc<StdMutex<EventReceiverState>>,
     warp_state: &mut WarpSessionState,
+    command_registry: &CommandRegistry,
 ) {
     let (passthrough, hooks) = warp_state.parser.consume(&data);
 
@@ -462,10 +549,35 @@ fn handle_incoming_bytes(
                 let block_id = warp_state.next_block_id;
                 warp_state.next_block_id = warp_state.next_block_id.saturating_add(1);
                 warp_state.current_block_id = Some(block_id);
+                let mut metadata = CommandExecutionMetadata {
+                    source: ExecutionSource::User,
+                    ..CommandExecutionMetadata::default()
+                };
+                if let Some(pending_ai_exec) = warp_state.pending_ai_exec_requests.pop_front() {
+                    metadata = pending_ai_exec.metadata;
+                    // Register the command before notifying Swift of the block_id to avoid
+                    // a race where await/read is called before the block exists.
+                    command_registry.start_command(block_id, command.clone(), metadata.clone());
+                    let metadata_json =
+                        serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+                    dispatch_event(
+                        event_state,
+                        SessionEvent::AIPreexec {
+                            command: pending_ai_exec.command,
+                            block_id,
+                            metadata_json,
+                        },
+                    );
+                    let _ = pending_ai_exec.response.send(Ok(block_id));
+                } else {
+                    command_registry.start_command(block_id, command.clone(), metadata.clone());
+                }
+                warp_state.active_metadata = Some(metadata.clone());
                 dispatch_event(event_state, SessionEvent::Preexec { command, block_id });
             }
             HookPayload::CommandFinished { exit_code } => {
                 if let Some(block_id) = warp_state.current_block_id {
+                    command_registry.finish_command(block_id, exit_code);
                     dispatch_event(
                         event_state,
                         SessionEvent::CommandFinished {
@@ -475,6 +587,7 @@ fn handle_incoming_bytes(
                     );
                 }
                 warp_state.current_block_id = None;
+                warp_state.active_metadata = None;
             }
             HookPayload::Precmd { pwd } => {
                 dispatch_event(
@@ -508,6 +621,8 @@ fn handle_incoming_bytes(
 
     if let Some(block_id) = warp_state.current_block_id {
         if !passthrough.is_empty() {
+            let output_text = String::from_utf8_lossy(&passthrough);
+            command_registry.append_output(block_id, &output_text);
             dispatch_event(
                 event_state,
                 SessionEvent::OutputChunk {
@@ -568,6 +683,14 @@ fn dispatch_event(event_state: &Arc<StdMutex<EventReceiverState>>, event: Sessio
 fn history_request_command(limit: u32) -> String {
     // Trailing carriage return executes in the interactive shell.
     format!("__warp_ios_request_history {}\r", limit.max(1))
+}
+
+fn parse_metadata_json(metadata_json: &str) -> Result<CommandExecutionMetadata, SshError> {
+    if metadata_json.trim().is_empty() {
+        return Ok(CommandExecutionMetadata::default());
+    }
+    serde_json::from_str::<CommandExecutionMetadata>(metadata_json)
+        .map_err(|e| SshError::ChannelError(format!("invalid command metadata: {e}")))
 }
 
 fn normalize_private_key_pem(raw_key: &str) -> String {
@@ -639,12 +762,14 @@ impl SshSession {
         let bootstrap_ok = Self::install_warp_hooks(&channel).await;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
+        let command_registry = CommandRegistry::new();
         RUNTIME.spawn(session_runner(
             channel,
             handle,
             cmd_rx,
             Arc::clone(&data_state),
             Arc::clone(&event_state),
+            command_registry.clone(),
             bootstrap_ok,
         ));
 
@@ -668,6 +793,7 @@ impl SshSession {
             cmd_tx,
             data_state,
             event_state,
+            command_registry,
         }))
     }
 
@@ -715,12 +841,14 @@ impl SshSession {
         let bootstrap_ok = Self::install_warp_hooks(&channel).await;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
+        let command_registry = CommandRegistry::new();
         RUNTIME.spawn(session_runner(
             channel,
             handle,
             cmd_rx,
             Arc::clone(&data_state),
             Arc::clone(&event_state),
+            command_registry.clone(),
             bootstrap_ok,
         ));
 
@@ -744,6 +872,7 @@ impl SshSession {
             cmd_tx,
             data_state,
             event_state,
+            command_registry,
         }))
     }
 
@@ -752,6 +881,56 @@ impl SshSession {
 
     pub fn send_data(&self, data: Vec<u8>) {
         let _ = self.cmd_tx.send(SessionCmd::Data(data));
+    }
+
+    pub async fn execute_command(
+        &self,
+        command: String,
+        metadata_json: String,
+    ) -> Result<u64, SshError> {
+        let metadata = parse_metadata_json(&metadata_json)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCmd::ExecuteCommand {
+                command,
+                metadata,
+                response: response_tx,
+            })
+            .map_err(|_| SshError::Disconnected)?;
+        response_rx.await.map_err(|_| SshError::Disconnected)?
+    }
+
+    pub async fn await_command_completion(
+        &self,
+        block_id: u64,
+        timeout_ms: u32,
+    ) -> Result<String, SshError> {
+        let timeout = if timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(timeout_ms as u64))
+        };
+        let snapshot = self
+            .command_registry
+            .await_completion(block_id, timeout)
+            .await
+            .ok_or_else(|| SshError::ChannelError(format!("unknown block_id: {block_id}")))?;
+        serde_json::to_string(&snapshot)
+            .map_err(|e| SshError::ChannelError(format!("failed to encode completion: {e}")))
+    }
+
+    pub fn read_command_output(&self, block_id: u64) -> String {
+        self.command_registry.read_output(block_id).unwrap_or_default()
+    }
+
+    pub fn write_to_running_command(&self, block_id: u64, data: Vec<u8>) {
+        let _ = self
+            .cmd_tx
+            .send(SessionCmd::WriteToRunningCommand { block_id, data });
+    }
+
+    pub fn cancel_running_command(&self, block_id: u64) {
+        let _ = self.cmd_tx.send(SessionCmd::CancelRunningCommand { block_id });
     }
 
     pub fn request_history(&self, limit: u32) {

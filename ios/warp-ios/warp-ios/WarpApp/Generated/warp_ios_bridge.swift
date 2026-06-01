@@ -546,7 +546,15 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 public protocol SshSessionProtocol : AnyObject {
     
+    func awaitCommandCompletion(blockId: UInt64, timeoutMs: UInt32) async throws  -> String
+    
+    func cancelRunningCommand(blockId: UInt64) 
+    
     func disconnect() async 
+    
+    func executeCommand(command: String, metadataJson: String) async throws  -> UInt64
+    
+    func readCommandOutput(blockId: UInt64)  -> String
     
     func requestHistory(limit: UInt32) 
     
@@ -557,6 +565,8 @@ public protocol SshSessionProtocol : AnyObject {
     func setEventReceiver(receiver: SessionEventReceiver) 
     
     func setReceiver(receiver: DataReceiver) 
+    
+    func writeToRunningCommand(blockId: UInt64, data: [UInt8]) 
     
 }
 
@@ -610,6 +620,30 @@ open class SshSession:
     
 
     
+open func awaitCommandCompletion(blockId: UInt64, timeoutMs: UInt32)async throws  -> String {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_warp_ios_bridge_fn_method_sshsession_await_command_completion(
+                    self.uniffiClonePointer(),
+                    FfiConverterUInt64.lower(blockId),FfiConverterUInt32.lower(timeoutMs)
+                )
+            },
+            pollFunc: ffi_warp_ios_bridge_rust_future_poll_rust_buffer,
+            completeFunc: ffi_warp_ios_bridge_rust_future_complete_rust_buffer,
+            freeFunc: ffi_warp_ios_bridge_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeSshError.lift
+        )
+}
+    
+open func cancelRunningCommand(blockId: UInt64) {try! rustCall() {
+    uniffi_warp_ios_bridge_fn_method_sshsession_cancel_running_command(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(blockId),$0
+    )
+}
+}
+    
 open func disconnect()async  {
     return
         try!  await uniffiRustCallAsync(
@@ -626,6 +660,31 @@ open func disconnect()async  {
             errorHandler: nil
             
         )
+}
+    
+open func executeCommand(command: String, metadataJson: String)async throws  -> UInt64 {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_warp_ios_bridge_fn_method_sshsession_execute_command(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(command),FfiConverterString.lower(metadataJson)
+                )
+            },
+            pollFunc: ffi_warp_ios_bridge_rust_future_poll_u64,
+            completeFunc: ffi_warp_ios_bridge_rust_future_complete_u64,
+            freeFunc: ffi_warp_ios_bridge_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeSshError.lift
+        )
+}
+    
+open func readCommandOutput(blockId: UInt64) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_warp_ios_bridge_fn_method_sshsession_read_command_output(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(blockId),$0
+    )
+})
 }
     
 open func requestHistory(limit: UInt32) {try! rustCall() {
@@ -660,6 +719,14 @@ open func setEventReceiver(receiver: SessionEventReceiver) {try! rustCall() {
 open func setReceiver(receiver: DataReceiver) {try! rustCall() {
     uniffi_warp_ios_bridge_fn_method_sshsession_set_receiver(self.uniffiClonePointer(),
         FfiConverterCallbackInterfaceDataReceiver.lower(receiver),$0
+    )
+}
+}
+    
+open func writeToRunningCommand(blockId: UInt64, data: [UInt8]) {try! rustCall() {
+    uniffi_warp_ios_bridge_fn_method_sshsession_write_to_running_command(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(blockId),
+        FfiConverterSequenceUInt8.lower(data),$0
     )
 }
 }
@@ -945,6 +1012,8 @@ public protocol SessionEventReceiver : AnyObject {
     
     func onPreexec(command: String, blockId: UInt64) 
     
+    func onAiPreexec(command: String, blockId: UInt64, metadataJson: String) 
+    
     func onCommandFinished(exitCode: Int32, blockId: UInt64) 
     
     func onPrecmd(workingDirectory: String) 
@@ -1006,6 +1075,34 @@ fileprivate struct UniffiCallbackInterfaceSessionEventReceiver {
                 return uniffiObj.onPreexec(
                      command: try FfiConverterString.lift(command),
                      blockId: try FfiConverterUInt64.lift(blockId)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onAiPreexec: { (
+            uniffiHandle: UInt64,
+            command: RustBuffer,
+            blockId: UInt64,
+            metadataJson: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceSessionEventReceiver.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onAiPreexec(
+                     command: try FfiConverterString.lift(command),
+                     blockId: try FfiConverterUInt64.lift(blockId),
+                     metadataJson: try FfiConverterString.lift(metadataJson)
                 )
             }
 
@@ -1327,7 +1424,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_warp_ios_bridge_checksum_func_ssh_connect_with_password() != 45263) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_warp_ios_bridge_checksum_method_sshsession_await_command_completion() != 45355) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_warp_ios_bridge_checksum_method_sshsession_cancel_running_command() != 46934) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_warp_ios_bridge_checksum_method_sshsession_disconnect() != 46942) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_warp_ios_bridge_checksum_method_sshsession_execute_command() != 11601) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_warp_ios_bridge_checksum_method_sshsession_read_command_output() != 10333) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_warp_ios_bridge_checksum_method_sshsession_request_history() != 18537) {
@@ -1345,6 +1454,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_warp_ios_bridge_checksum_method_sshsession_set_receiver() != 38872) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_warp_ios_bridge_checksum_method_sshsession_write_to_running_command() != 39543) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_warp_ios_bridge_checksum_method_datareceiver_on_data() != 16404) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1355,6 +1467,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_warp_ios_bridge_checksum_method_sessioneventreceiver_on_preexec() != 28859) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_warp_ios_bridge_checksum_method_sessioneventreceiver_on_ai_preexec() != 32090) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_warp_ios_bridge_checksum_method_sessioneventreceiver_on_command_finished() != 40848) {
