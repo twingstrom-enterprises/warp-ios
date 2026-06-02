@@ -12,21 +12,6 @@ enum InputRoutingMode: String, CaseIterable, Identifiable {
     var title: String { rawValue.uppercased() }
 }
 
-private enum IOSFeatureFlags {
-    static let aiToolsRoutingUserDefaultsKey = "warp_ios_ai_tools_routing_enabled"
-
-    static var aiToolsRoutingEnabled: Bool {
-        if UserDefaults.standard.object(forKey: aiToolsRoutingUserDefaultsKey) == nil {
-            #if DEBUG
-            return true
-            #else
-            return false
-            #endif
-        }
-        return UserDefaults.standard.bool(forKey: aiToolsRoutingUserDefaultsKey)
-    }
-}
-
 private struct BridgeExecutionMetadata: Encodable {
     let source: String
     let action_id: String?
@@ -96,7 +81,7 @@ class SSHSession {
     var isRoutingModeForced: Bool { manualRoutingOverrideMode != nil }
     var pendingAICommandSuggestion: PendingAICommandSuggestion?
     var aiIsThinking = false
-    private(set) var aiToolsEnabled = IOSFeatureFlags.aiToolsRoutingEnabled
+    private(set) var aiToolsEnabled = true
     private(set) var isWarpLoggedIn = false
     private(set) var warpUserEmail: String?
     @ObservationIgnored private lazy var aiActionOrchestrator = IOSAIActionOrchestrator(session: self)
