@@ -5,7 +5,11 @@ use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use russh::client::{self, Handle};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::iter::Peekable;
+use std::mem;
+use std::str::Chars;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -20,6 +24,344 @@ static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .build()
         .expect("Failed to create Tokio runtime")
 });
+
+const ONE_OFF_SHELL_COMMAND_KEYWORDS: &[&str] =
+    &["#", "echo", "man", "sudo", "claude", "codex", "gemini"];
+const ONE_OFF_NATURAL_LANGUAGE_WORDS: &[&str] =
+    &["hello", "hi", "hey", "hola", "thanks", "explain", "yes", "no", "what", "nice", "1. "];
+const AGENT_FOLLOW_UP_INPUTS: &[&str] = &["yes", "continue", "do it", "approve"];
+
+const DETECT_AS_COMMAND_THRESHOLD: f32 = 0.5;
+const DETECT_AS_COMMAND_LOW_TOKEN_THRESHOLD: f32 = 0.7;
+const MINIMUM_COMMAND_DETECTION_TOKEN_LENGTH: usize = 2;
+const MINIMUM_NATURAL_LANGUAGE_DETECTION_TOKEN_LENGTH: usize = 2;
+const DETECT_AS_NATURAL_LANGUAGE_THRESHOLD: f32 = 0.6;
+const DETECT_AS_NATURAL_LANGUAGE_LOW_TOKEN_THRESHOLD: f32 = 0.8;
+
+pub struct InputIntentClassification {
+    pub mode: String,
+    pub source: String,
+    pub confidence: f32,
+}
+
+pub async fn classify_input_intent(
+    buffer_text: String,
+    current_mode: String,
+    is_agent_follow_up: bool,
+) -> InputIntentClassification {
+    let trimmed = buffer_text.trim();
+    if trimmed.is_empty() {
+        return InputIntentClassification {
+            mode: "shell".to_string(),
+            source: "EmptyInput".to_string(),
+            confidence: 1.0,
+        };
+    }
+
+    let lower_trimmed = trimmed.to_lowercase();
+    if is_agent_follow_up && AGENT_FOLLOW_UP_INPUTS.contains(&lower_trimmed.as_str()) {
+        return InputIntentClassification {
+            mode: "ai".to_string(),
+            source: "AgentFollowUpAllowlist".to_string(),
+            confidence: 1.0,
+        };
+    }
+
+    let tokens = parse_query_into_tokens(trimmed);
+    if tokens.is_empty() {
+        return InputIntentClassification {
+            mode: "shell".to_string(),
+            source: "EmptyTokens".to_string(),
+            confidence: 1.0,
+        };
+    }
+
+    if tokens.len() == 1
+        && is_one_off_natural_language_word_or_prefix(tokens[0].to_lowercase().as_str())
+    {
+        return InputIntentClassification {
+            mode: "ai".to_string(),
+            source: "NaturalLanguageOneOffAllowlist".to_string(),
+            confidence: 1.0,
+        };
+    }
+
+    if is_one_off_shell_keyword(tokens[0].to_lowercase().as_str()) {
+        return InputIntentClassification {
+            mode: "shell".to_string(),
+            source: "ShellCommandAllowList".to_string(),
+            confidence: 1.0,
+        };
+    }
+
+    let current_mode_is_ai = current_mode.eq_ignore_ascii_case("ai");
+    let shell_heuristic = shell_heuristic_score(&tokens);
+    if shell_heuristic.is_shell {
+        return InputIntentClassification {
+            mode: "shell".to_string(),
+            source: "ShellHeuristic".to_string(),
+            confidence: shell_heuristic.confidence,
+        };
+    }
+
+    let natural_language = natural_language_score(&tokens, current_mode_is_ai);
+    let is_ai = natural_language.score >= natural_language.threshold;
+    InputIntentClassification {
+        mode: if is_ai {
+            "ai".to_string()
+        } else {
+            "shell".to_string()
+        },
+        source: "InputClassifierFallbackHeuristic".to_string(),
+        confidence: natural_language.confidence,
+    }
+}
+
+struct ShellHeuristicResult {
+    is_shell: bool,
+    confidence: f32,
+}
+
+struct NaturalLanguageHeuristicResult {
+    score: f32,
+    threshold: f32,
+    confidence: f32,
+}
+
+fn shell_heuristic_score(tokens: &[String]) -> ShellHeuristicResult {
+    let total = tokens.len();
+    if total == 0 {
+        return ShellHeuristicResult {
+            is_shell: true,
+            confidence: 1.0,
+        };
+    }
+
+    let first_is_command = is_probable_command_token(tokens[0].as_str());
+    let command_like_count = tokens
+        .iter()
+        .filter(|token| {
+            let lowered = token.to_lowercase();
+            is_probable_command_token(lowered.as_str())
+                || natural_language_detection::check_if_token_has_shell_syntax(lowered.as_str())
+        })
+        .count();
+    let threshold = if total <= 2 {
+        1.0
+    } else if total <= 4 {
+        DETECT_AS_COMMAND_LOW_TOKEN_THRESHOLD
+    } else {
+        DETECT_AS_COMMAND_THRESHOLD
+    };
+    let ratio = command_like_count as f32 / total as f32;
+    let is_shell = command_like_count >= ((total as f32 * threshold).ceil() as usize)
+        || (total < 3 && first_is_command);
+
+    ShellHeuristicResult {
+        is_shell,
+        confidence: ratio.clamp(0.0, 1.0).max(if is_shell { 0.7 } else { 0.0 }),
+    }
+}
+
+fn natural_language_score(
+    tokens: &[String],
+    current_mode_is_ai: bool,
+) -> NaturalLanguageHeuristicResult {
+    let total = tokens.len();
+    if total == 0 {
+        return NaturalLanguageHeuristicResult {
+            score: 0.0,
+            threshold: 1.0,
+            confidence: 1.0,
+        };
+    }
+
+    let min_token_length = if current_mode_is_ai {
+        MINIMUM_COMMAND_DETECTION_TOKEN_LENGTH
+    } else {
+        MINIMUM_NATURAL_LANGUAGE_DETECTION_TOKEN_LENGTH
+    };
+    if total < min_token_length {
+        return NaturalLanguageHeuristicResult {
+            score: 0.0,
+            threshold: 1.0,
+            confidence: 1.0,
+        };
+    }
+
+    let first_is_command = is_probable_command_token(tokens[0].as_str());
+    let words = tokens
+        .iter()
+        .map(|token| Cow::Owned(token.to_lowercase()))
+        .collect::<Vec<_>>();
+    let nl_word_count = natural_language_detection::natural_language_words_score(words, first_is_command);
+    let score = nl_word_count as f32 / total as f32;
+    let threshold = if total <= 3 {
+        1.0
+    } else if total <= 4 {
+        DETECT_AS_NATURAL_LANGUAGE_LOW_TOKEN_THRESHOLD
+    } else {
+        DETECT_AS_NATURAL_LANGUAGE_THRESHOLD
+    };
+    let confidence = if score >= threshold {
+        score
+    } else {
+        (1.0 - score).clamp(0.0, 1.0)
+    };
+
+    NaturalLanguageHeuristicResult {
+        score,
+        threshold,
+        confidence: confidence.clamp(0.0, 1.0),
+    }
+}
+
+fn is_probable_command_token(token: &str) -> bool {
+    let lowered = token.to_lowercase();
+    natural_language_detection::is_word(
+        lowered.trim_matches(|c: char| c.is_ascii_punctuation()),
+        natural_language_detection::WordDb::Command,
+    )
+}
+
+fn is_one_off_shell_keyword(word: &str) -> bool {
+    ONE_OFF_SHELL_COMMAND_KEYWORDS.contains(&word)
+}
+
+fn is_one_off_natural_language_word_or_prefix(word: &str) -> bool {
+    ONE_OFF_NATURAL_LANGUAGE_WORDS.contains(&word)
+        || ONE_OFF_NATURAL_LANGUAGE_WORDS
+            .iter()
+            .any(|natural_word| natural_word.starts_with(word))
+}
+
+fn parse_query_into_tokens(query: &str) -> Vec<String> {
+    let parser = SentenceParser {
+        chars: query.chars().peekable(),
+        active_delimiter: None,
+        active_token: String::new(),
+    };
+
+    parser.collect()
+}
+
+#[derive(PartialEq, Eq)]
+enum WordDelimiter {
+    Separator,
+    DoubleQuote,
+    SingleQuote,
+    Backtick,
+    Whitespace,
+}
+
+fn convert_char_to_delimiter(c: char) -> Option<WordDelimiter> {
+    match c {
+        '\'' => Some(WordDelimiter::SingleQuote),
+        '"' => Some(WordDelimiter::DoubleQuote),
+        '`' => Some(WordDelimiter::Backtick),
+        ',' | '.' | '!' | '?' => Some(WordDelimiter::Separator),
+        c if c.is_whitespace() => Some(WordDelimiter::Whitespace),
+        _ => None,
+    }
+}
+
+struct SentenceParser<'a> {
+    chars: Peekable<Chars<'a>>,
+    active_delimiter: Option<WordDelimiter>,
+    active_token: String,
+}
+
+impl Iterator for SentenceParser<'_> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(c) = self.chars.next() {
+            let delimiter = convert_char_to_delimiter(c);
+            let next_delimiter = self.chars.peek().map(|next| convert_char_to_delimiter(*next));
+
+            match delimiter {
+                Some(WordDelimiter::Whitespace) if self.active_delimiter.is_none() => {
+                    if self.active_token.is_empty() {
+                        continue;
+                    }
+                    return Some(mem::take(&mut self.active_token));
+                }
+                Some(WordDelimiter::Separator) if self.active_delimiter.is_none() => {
+                    if self.active_token.is_empty() {
+                        continue;
+                    }
+                    if next_delimiter
+                        .map(|delim| delim == Some(WordDelimiter::Whitespace))
+                        .unwrap_or(true)
+                    {
+                        return Some(mem::take(&mut self.active_token));
+                    }
+                    self.active_token.push(c);
+                }
+                Some(WordDelimiter::DoubleQuote) => {
+                    let complete = if self.active_delimiter == Some(WordDelimiter::DoubleQuote) {
+                        self.active_delimiter = None;
+                        true
+                    } else if !self.active_token.is_empty() || self.active_delimiter.is_some() {
+                        false
+                    } else {
+                        self.active_delimiter = Some(WordDelimiter::DoubleQuote);
+                        false
+                    };
+                    self.active_token.push(c);
+                    if complete {
+                        let token = mem::take(&mut self.active_token);
+                        if token == "\"\"" {
+                            continue;
+                        }
+                        return Some(token);
+                    }
+                }
+                Some(WordDelimiter::SingleQuote) => {
+                    let complete = if self.active_delimiter == Some(WordDelimiter::SingleQuote) {
+                        self.active_delimiter = None;
+                        true
+                    } else if !self.active_token.is_empty() || self.active_delimiter.is_some() {
+                        false
+                    } else {
+                        self.active_delimiter = Some(WordDelimiter::SingleQuote);
+                        false
+                    };
+                    self.active_token.push(c);
+                    if complete {
+                        let token = mem::take(&mut self.active_token);
+                        if token == "''" {
+                            continue;
+                        }
+                        return Some(token);
+                    }
+                }
+                Some(WordDelimiter::Backtick) => {
+                    let complete = if self.active_delimiter == Some(WordDelimiter::Backtick) {
+                        self.active_delimiter = None;
+                        true
+                    } else if !self.active_token.is_empty() || self.active_delimiter.is_some() {
+                        false
+                    } else {
+                        self.active_delimiter = Some(WordDelimiter::Backtick);
+                        false
+                    };
+                    self.active_token.push(c);
+                    if complete {
+                        return Some(mem::take(&mut self.active_token));
+                    }
+                }
+                _ => self.active_token.push(c),
+            }
+        }
+
+        if self.active_token.is_empty() {
+            None
+        } else {
+            Some(mem::take(&mut self.active_token))
+        }
+    }
+}
 
 /// Pre-warm the Tokio runtime so the first SSH connection doesn't pay the
 /// lazy-init cost (~200ms of thread spawning).
@@ -1120,7 +1462,7 @@ fi
 
 #[cfg(test)]
 mod tests {
-    use super::{history_request_command, HookPayload, OscHookParser};
+    use super::{classify_input_intent, history_request_command, HookPayload, OscHookParser};
 
     #[test]
     fn parses_plain_osc_hook_and_keeps_display_bytes() {
@@ -1181,5 +1523,42 @@ mod tests {
             history_request_command(250),
             "__warp_ios_request_history 250\r"
         );
+    }
+
+    #[tokio::test]
+    async fn classify_shell_command_prefers_shell() {
+        let result = classify_input_intent("git status".to_string(), "shell".to_string(), false).await;
+        assert_eq!(result.mode, "shell");
+    }
+
+    #[tokio::test]
+    async fn classify_natural_language_prefers_ai() {
+        let result = classify_input_intent(
+            "how do i list files recursively".to_string(),
+            "shell".to_string(),
+            false,
+        )
+        .await;
+        assert_eq!(result.mode, "ai");
+    }
+
+    #[tokio::test]
+    async fn classify_forced_shell_prefixes_as_shell() {
+        let bang_result =
+            classify_input_intent("!ls -la".to_string(), "ai".to_string(), false).await;
+        let run_result = classify_input_intent(
+            "run ls -la".to_string(),
+            "ai".to_string(),
+            false,
+        )
+        .await;
+        assert_eq!(bang_result.mode, "shell");
+        assert_eq!(run_result.mode, "shell");
+    }
+
+    #[tokio::test]
+    async fn classify_agent_follow_up_as_ai() {
+        let result = classify_input_intent("continue".to_string(), "shell".to_string(), true).await;
+        assert_eq!(result.mode, "ai");
     }
 }

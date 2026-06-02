@@ -479,6 +479,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
+    typealias FfiType = Float
+    typealias SwiftType = Float
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
+        return try lift(readFloat(&buf))
+    }
+
+    public static func write(_ value: Float, into buf: inout [UInt8]) {
+        writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -783,6 +799,80 @@ public func FfiConverterTypeSshSession_lift(_ pointer: UnsafeMutableRawPointer) 
 #endif
 public func FfiConverterTypeSshSession_lower(_ value: SshSession) -> UnsafeMutableRawPointer {
     return FfiConverterTypeSshSession.lower(value)
+}
+
+
+public struct InputIntentClassification {
+    public var mode: String
+    public var source: String
+    public var confidence: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(mode: String, source: String, confidence: Float) {
+        self.mode = mode
+        self.source = source
+        self.confidence = confidence
+    }
+}
+
+
+
+extension InputIntentClassification: Equatable, Hashable {
+    public static func ==(lhs: InputIntentClassification, rhs: InputIntentClassification) -> Bool {
+        if lhs.mode != rhs.mode {
+            return false
+        }
+        if lhs.source != rhs.source {
+            return false
+        }
+        if lhs.confidence != rhs.confidence {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(mode)
+        hasher.combine(source)
+        hasher.combine(confidence)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeInputIntentClassification: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> InputIntentClassification {
+        return
+            try InputIntentClassification(
+                mode: FfiConverterString.read(from: &buf), 
+                source: FfiConverterString.read(from: &buf), 
+                confidence: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: InputIntentClassification, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.mode, into: &buf)
+        FfiConverterString.write(value.source, into: &buf)
+        FfiConverterFloat.write(value.confidence, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeInputIntentClassification_lift(_ buf: RustBuffer) throws -> InputIntentClassification {
+    return try FfiConverterTypeInputIntentClassification.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeInputIntentClassification_lower(_ value: InputIntentClassification) -> RustBuffer {
+    return FfiConverterTypeInputIntentClassification.lower(value)
 }
 
 
@@ -1366,6 +1456,21 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
+public func classifyInputIntent(bufferText: String, currentMode: String, isAgentFollowUp: Bool)async  -> InputIntentClassification {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_warp_ios_bridge_fn_func_classify_input_intent(FfiConverterString.lower(bufferText),FfiConverterString.lower(currentMode),FfiConverterBool.lower(isAgentFollowUp)
+                )
+            },
+            pollFunc: ffi_warp_ios_bridge_rust_future_poll_rust_buffer,
+            completeFunc: ffi_warp_ios_bridge_rust_future_complete_rust_buffer,
+            freeFunc: ffi_warp_ios_bridge_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeInputIntentClassification.lift,
+            errorHandler: nil
+            
+        )
+}
 public func initializeBridge() {try! rustCall() {
     uniffi_warp_ios_bridge_fn_func_initialize_bridge($0
     )
@@ -1414,6 +1519,9 @@ private var initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_warp_ios_bridge_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_warp_ios_bridge_checksum_func_classify_input_intent() != 42175) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_warp_ios_bridge_checksum_func_initialize_bridge() != 15690) {
         return InitializationResult.apiChecksumMismatch

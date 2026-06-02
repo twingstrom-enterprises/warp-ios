@@ -88,8 +88,12 @@ class SSHSession {
     private(set) var currentInputBuffer = ""
     private var richHistoryNeedsRefresh = true
     private var localHistoryStorageKey: String?
-    var inputRoutingMode: InputRoutingMode = .shell
-    var aiPromptDraft = ""
+    private var autoDetectedRoutingMode: InputRoutingMode = .shell
+    private var manualRoutingOverrideMode: InputRoutingMode?
+    private var classifyDraftTask: Task<Void, Never>?
+    private let classifyDebounceNanoseconds: UInt64 = 120_000_000
+    private(set) var inputRoutingMode: InputRoutingMode = .shell
+    var isRoutingModeForced: Bool { manualRoutingOverrideMode != nil }
     var pendingAICommandSuggestion: PendingAICommandSuggestion?
     var aiIsThinking = false
     private(set) var aiToolsEnabled = IOSFeatureFlags.aiToolsRoutingEnabled
@@ -109,7 +113,21 @@ class SSHSession {
         refreshWarpAuthState()
     }
 
+    func setManualRoutingModeOverride(_ mode: InputRoutingMode) {
+        manualRoutingOverrideMode = mode
+        updateEffectiveRoutingMode()
+    }
+
+    func clearManualRoutingModeOverride() {
+        manualRoutingOverrideMode = nil
+        updateEffectiveRoutingMode()
+    }
+
     func connect(host: SSHHost, password: String? = nil) async {
+        classifyDraftTask?.cancel()
+        autoDetectedRoutingMode = .shell
+        manualRoutingOverrideMode = nil
+        updateEffectiveRoutingMode()
         blockStore.reset()
         promptFeedState = .interactive
         resetRichHistoryState()
@@ -169,6 +187,7 @@ class SSHSession {
 
     // Called by the Rust bridge when the remote session ends (channel EOF/close).
     func handleRemoteDisconnect() {
+        classifyDraftTask?.cancel()
         persistTypingHistory()
         isConnected = false
         rustSession = nil
@@ -222,6 +241,22 @@ class SSHSession {
             return true
         }
 
+        if isEnter(bytes), shouldRouteCurrentInputToAI {
+            let prompt = currentInputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !prompt.isEmpty else {
+                updateCurrentInputBuffer(for: bytes)
+                return false
+            }
+            if aiIsThinking {
+                blockStore.applyStatus("Warp AI is still processing your previous request.")
+                return true
+            }
+            currentInputBuffer = ""
+            renderSyntheticPromptInTerminal()
+            submitPromptFromTerminal(prompt)
+            return true
+        }
+
         updateCurrentInputBuffer(for: bytes)
         return false
     }
@@ -238,13 +273,30 @@ class SSHSession {
     }
 
     func submitAIPrompt() async {
+        submitPromptFromTerminal(aiPromptTextForLegacyCall())
+    }
+
+    private func aiPromptTextForLegacyCall() -> String {
+        currentInputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var shouldRouteCurrentInputToAI: Bool {
+        aiToolsEnabled && inputRoutingMode == .ai
+    }
+
+    private func submitPromptFromTerminal(_ prompt: String) {
         guard aiToolsEnabled else { return }
-        let prompt = aiPromptDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
-        aiPromptDraft = ""
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPrompt.isEmpty else { return }
         aiIsThinking = true
-        defer { aiIsThinking = false }
-        await aiActionOrchestrator.handle(prompt: prompt)
+        let promptToSubmit = trimmedPrompt
+        Task { [weak self] in
+            guard let self else { return }
+            await self.aiActionOrchestrator.handle(prompt: promptToSubmit)
+            self.aiIsThinking = false
+            self.clearManualRoutingModeOverride()
+            self.scheduleInputModeAutoDetection()
+        }
     }
 
     func approvePendingAICommandSuggestion() async {
@@ -285,6 +337,9 @@ class SSHSession {
                 NSLocalizedDescriptionKey: "No active SSH session"
             ])
         }
+        // Cancel any partially typed interactive line before injecting the AI command.
+        // This avoids concatenating leaked draft prompt text with the generated command.
+        rustSession.sendData(data: [0x03])
         let metadata = BridgeExecutionMetadata.ai(
             actionID: actionID,
             conversationID: conversationID,
@@ -370,6 +425,7 @@ class SSHSession {
     }
 
     func disconnect() async {
+        classifyDraftTask?.cancel()
         persistTypingHistory()
         await rustSession?.disconnect()
         isConnected = false
@@ -397,11 +453,7 @@ class SSHSession {
         // Keep suppressing stream bytes until precmd arrives so trailing output
         // does not leak into the prompt area.
         promptFeedState = .awaitingPrecmd
-        // In AI mode, the SwiftUI TextField owns keyboard focus. Forcing
-        // SwiftTerm to become first responder here can trigger UIKit keyboard
-        // accessory constraint conflicts.
-        let shouldRefocusTerminal = inputRoutingMode == .shell
-        if blockStore.isBootstrapped, !blockStore.fallbackModeEnabled, shouldRefocusTerminal {
+        if blockStore.isBootstrapped, !blockStore.fallbackModeEnabled {
             focusTerminalIfNeeded()
         }
     }
@@ -461,7 +513,6 @@ class SSHSession {
     }
 
     func focusTerminalIfNeeded() {
-        guard inputRoutingMode == .shell else { return }
         DispatchQueue.main.async { [weak terminalView] in
             _ = terminalView?.becomeFirstResponder()
         }
@@ -481,7 +532,55 @@ class SSHSession {
         blockStore.isBootstrapped && !blockStore.fallbackModeEnabled
     }
 
+    private var isAgentFollowUpForAutoDetection: Bool {
+        blockStore.blocks.last?.commandSource == .ai
+    }
+
+    private func updateEffectiveRoutingMode() {
+        inputRoutingMode = manualRoutingOverrideMode ?? autoDetectedRoutingMode
+    }
+
+    private func scheduleInputModeAutoDetection() {
+        guard aiToolsEnabled else {
+            autoDetectedRoutingMode = .shell
+            updateEffectiveRoutingMode()
+            return
+        }
+
+        classifyDraftTask?.cancel()
+        let draft = currentInputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if draft.isEmpty {
+            autoDetectedRoutingMode = .shell
+            updateEffectiveRoutingMode()
+            return
+        }
+
+        let currentMode = autoDetectedRoutingMode.rawValue
+        let isAgentFollowUp = isAgentFollowUpForAutoDetection
+        classifyDraftTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(nanoseconds: self.classifyDebounceNanoseconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            let result = await classifyInputIntent(
+                bufferText: draft,
+                currentMode: currentMode,
+                isAgentFollowUp: isAgentFollowUp
+            )
+            guard !Task.isCancelled else { return }
+            self.autoDetectedRoutingMode = result.mode.lowercased() == "ai" ? .ai : .shell
+            self.updateEffectiveRoutingMode()
+        }
+    }
+
     private func resetRichHistoryState() {
+        classifyDraftTask?.cancel()
+        autoDetectedRoutingMode = .shell
+        manualRoutingOverrideMode = nil
+        updateEffectiveRoutingMode()
         richHistoryVisible = false
         richHistoryIsLoading = false
         richHistoryRequested = false
@@ -571,11 +670,11 @@ class SSHSession {
     }
 
     private func updateCurrentInputBuffer(for bytes: [UInt8]) {
-        guard isRichHistoryEligible else { return }
         guard !bytes.isEmpty else { return }
 
         if isEnter(bytes) {
             currentInputBuffer = ""
+            scheduleInputModeAutoDetection()
             return
         }
 
@@ -583,6 +682,7 @@ class SSHSession {
             if !currentInputBuffer.isEmpty {
                 currentInputBuffer.removeLast()
             }
+            scheduleInputModeAutoDetection()
             return
         }
 
@@ -592,6 +692,7 @@ class SSHSession {
 
         if let typed = String(bytes: bytes, encoding: .utf8), !typed.isEmpty {
             currentInputBuffer.append(typed)
+            scheduleInputModeAutoDetection()
         }
     }
 
@@ -861,7 +962,9 @@ final class IOSAIActionOrchestrator {
                 session.blockStore.applyStatus("Log in to Warp AI first, or use `run <shell command>` / `!<shell command>`.")
                 return
             }
-            if shouldUseDialogue(for: prompt) {
+            let dialoguePath = shouldUseDialogue(for: prompt)
+            let fileSearchLike = looksLikeFileSearchPrompt(prompt)
+            if dialoguePath {
                 do {
                     let answer = try await session.generateDialogueFromWarpAI(prompt: prompt)
                     if isProgrammingOnlyGuardrail(answer) {
@@ -891,7 +994,9 @@ final class IOSAIActionOrchestrator {
             }
             do {
                 let generated = try await session.generateCommandFromWarpAI(prompt: prompt)
-                if isLowSignalEchoCommand(generated.command, prompt: prompt) {
+                let hydratedCommand = hydrateTemplateCommandIfNeeded(generated.command, prompt: prompt)
+                let optimizedCommand = optimizeFileSearchCommandIfNeeded(hydratedCommand, prompt: prompt)
+                if isLowSignalEchoCommand(optimizedCommand, prompt: prompt) {
                     session.trace("ai backend returned low-signal echo command; skipping execution")
                     session.blockStore.applyStatus(
                         "AI suggested a placeholder echo command instead of a useful action. " +
@@ -901,14 +1006,14 @@ final class IOSAIActionOrchestrator {
                 }
                 session.pendingAICommandSuggestion = PendingAICommandSuggestion(
                     prompt: prompt,
-                    command: generated.command,
+                    command: optimizedCommand,
                     description: generated.description
                 )
                 session.trace(
-                    "ai backend generated command='\(generated.command)' description='\(generated.description)'"
+                    "ai backend generated command='\(optimizedCommand)' description='\(generated.description)'"
                 )
                 session.blockStore.applyStatus(
-                    "AI suggested `\(generated.command)`. Review and tap Run to execute. Nothing has run yet."
+                    "AI suggested `\(optimizedCommand)`. Review and tap Run to execute. Nothing has run yet."
                 )
             } catch {
                 session.trace("ai backend request failed error=\(error.localizedDescription)")
@@ -979,7 +1084,9 @@ final class IOSAIActionOrchestrator {
 
     private func isLowSignalEchoCommand(_ command: String, prompt: String) -> Bool {
         guard let echoed = echoedText(from: command) else { return false }
-        return normalizeLowSignalText(echoed) == normalizeLowSignalText(prompt)
+        let normalizedEcho = normalizeLowSignalText(echoed)
+        let normalizedPrompt = normalizeLowSignalText(prompt)
+        return normalizedEcho == normalizedPrompt
     }
 
     private func echoedText(from command: String) -> String? {
@@ -1014,6 +1121,10 @@ final class IOSAIActionOrchestrator {
             return false
         }
 
+        if looksLikeFileSearchPrompt(prompt) {
+            return false
+        }
+
         // If the request looks like shell intent, prefer command generation path.
         let shellIntentNeedles = [
             "command", "shell", "terminal", "bash", "zsh", "linux", "ssh",
@@ -1025,6 +1136,99 @@ final class IOSAIActionOrchestrator {
         }
         // Default AI mode behavior should be conversational unless command intent is explicit.
         return true
+    }
+
+    private func looksLikeFileSearchPrompt(_ prompt: String) -> Bool {
+        let normalized = prompt.lowercased()
+        let hasFileScope = normalized.contains(" file")
+            || normalized.contains("files ")
+            || normalized.contains("filename")
+            || normalized.contains("repo")
+            || normalized.contains("project")
+            || normalized.contains("directory")
+            || normalized.contains("folder")
+        let hasSearchIntent = normalized.contains("find ")
+            || normalized.contains("look for")
+            || normalized.contains("search")
+            || normalized.contains("contain")
+            || normalized.contains("contains")
+            || normalized.contains("named ")
+            || normalized.contains("name ")
+            || normalized.contains("string ")
+        return hasFileScope && hasSearchIntent
+    }
+
+    private func hydrateTemplateCommandIfNeeded(_ command: String, prompt: String) -> String {
+        var hydrated = command
+        let searchTerm = extractSearchTerm(from: prompt)
+        if let searchTerm {
+            let quotedSearchTerm = shellQuote(searchTerm)
+            hydrated = hydrated.replacingOccurrences(of: "'{{search_string}}'", with: quotedSearchTerm)
+            hydrated = hydrated.replacingOccurrences(of: "\"{{search_string}}\"", with: quotedSearchTerm)
+            hydrated = hydrated.replacingOccurrences(of: "{{search_string}}", with: quotedSearchTerm)
+            hydrated = hydrated.replacingOccurrences(of: "{{query}}", with: quotedSearchTerm)
+            hydrated = hydrated.replacingOccurrences(of: "{{pattern}}", with: quotedSearchTerm)
+        }
+        hydrated = hydrated.replacingOccurrences(of: "{{directory}}", with: ".")
+        hydrated = hydrated.replacingOccurrences(of: "{{path}}", with: ".")
+        return hydrated
+    }
+
+    private func containsTemplatePlaceholders(_ command: String) -> Bool {
+        command.contains("{{") && command.contains("}}")
+    }
+
+    private func optimizeFileSearchCommandIfNeeded(_ command: String, prompt: String) -> String {
+        guard looksLikeFileSearchPrompt(prompt) else { return command }
+        let normalized = command.lowercased()
+        guard normalized.contains("grep -r"), normalized.contains(" -l ") || normalized.contains("-rl") else {
+            return command
+        }
+        guard let searchTerm = extractSearchTerm(from: prompt) else { return command }
+        let quotedSearchTerm = shellQuote(searchTerm)
+        // Prefer ripgrep for significantly faster recursive content search.
+        return "rg -l --fixed-strings \(quotedSearchTerm) ."
+    }
+
+    private func extractSearchTerm(from prompt: String) -> String? {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let quotePatterns = ["\"([^\"]+)\"", "'([^']+)'"]
+        for pattern in quotePatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern),
+               let match = regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)),
+               match.numberOfRanges >= 2,
+               let range = Range(match.range(at: 1), in: trimmed) {
+                let captured = String(trimmed[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !captured.isEmpty {
+                    return captured
+                }
+            }
+        }
+
+        let tokenPatterns = [
+            "(?:string|name|named)\\s+([A-Za-z0-9._-]+)",
+            "find\\s+([A-Za-z0-9._-]+)"
+        ]
+        for pattern in tokenPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+               let match = regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)),
+               match.numberOfRanges >= 2,
+               let range = Range(match.range(at: 1), in: trimmed) {
+                let captured = String(trimmed[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !captured.isEmpty {
+                    return captured
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        let escaped = value.replacingOccurrences(of: "'", with: "'\"'\"'")
+        return "'\(escaped)'"
     }
 
     private func isProgrammingOnlyGuardrail(_ answer: String) -> Bool {
@@ -1577,6 +1781,8 @@ final class WarpAIBackendClient {
             if let data,
                let conversation = try? JSONSerialization.jsonObject(with: data),
                let candidate = extractLatestAssistantMessage(from: conversation, expectedPrompt: expectedPrompt) {
+                let normalizedExpected = normalizePromptForMatching(expectedPrompt)
+                let normalizedCandidate = normalizePromptForMatching(candidate.text)
                 let fingerprint = "\(candidate.id ?? "no-id"):\(candidate.text)"
                 if fingerprint != lastAgentAssistantFingerprint {
                     lastAgentAssistantFingerprint = fingerprint
@@ -1698,6 +1904,8 @@ final class WarpAIBackendClient {
         else {
             return nil
         }
+        let normalizedExpected = normalizePromptForMatching(expectedPrompt)
+        let normalizedCandidate = normalizePromptForMatching(candidate.text)
 
         let fingerprint = "\(candidate.id ?? "no-id"):\(candidate.text)"
         guard fingerprint != lastAgentAssistantFingerprint else {
@@ -1935,13 +2143,15 @@ final class WarpAIBackendClient {
         guard !normalizedPrompt.isEmpty else { return false }
 
         let stepDescription = (step["description"] as? String ?? "").lowercased()
-        if !stepDescription.isEmpty
-            && (stepDescription.contains(normalizedPrompt) || normalizedPrompt.contains(stepDescription)) {
+        let descriptionMatch = !stepDescription.isEmpty
+            && (stepDescription.contains(normalizedPrompt) || normalizedPrompt.contains(stepDescription))
+        if descriptionMatch {
             return true
         }
 
         let stepText = flattenText(step).lowercased()
-        if stepText.contains(normalizedPrompt) {
+        let textContainsPrompt = stepText.contains(normalizedPrompt)
+        if textContainsPrompt {
             return true
         }
 
@@ -1949,7 +2159,8 @@ final class WarpAIBackendClient {
         guard !promptTokens.isEmpty else { return false }
         let stepTokens = Set(stepText.split(whereSeparator: \.isWhitespace).map(String.init))
         let overlap = promptTokens.intersection(stepTokens).count
-        return overlap >= min(3, max(1, promptTokens.count / 2))
+        let threshold = min(3, max(1, promptTokens.count / 2))
+        return overlap >= threshold
     }
 
     private func normalizePromptForMatching(_ prompt: String) -> String {
@@ -1983,10 +2194,16 @@ final class WarpAIBackendClient {
                 || roleLike.contains("ai")
                 || roleLike.contains("model")
             if let text = assistantText(from: dict) {
-                // If role metadata is absent, accept long non-question outputs
-                // to avoid dropping valid assistant content from run conversation payloads.
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                // If role metadata explicitly exists and is not assistant-like,
+                // skip this message to avoid selecting user echoes as replies.
                 if !isAssistantLike {
-                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !roleLike.isEmpty {
+                        continue
+                    }
+
+                    // If role metadata is absent, accept long non-question outputs
+                    // to avoid dropping valid assistant content from run conversation payloads.
                     if trimmed.hasSuffix("?") || trimmed.count < 24 {
                         continue
                     }

@@ -12,6 +12,7 @@ path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
 ai_terminal_runtime = { workspace = true }
+natural_language_detection = { workspace = true }
 uniffi = { version = "0.28", features = ["tokio", "cli"] }
 russh = "0.44"
 russh-keys = "0.44"
