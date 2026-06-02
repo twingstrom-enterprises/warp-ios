@@ -8,7 +8,6 @@ struct ConnectedTerminalView: View {
     @State private var jumpToBottomRequest = 0
     @State private var showPasswordPrompt = false
     @State private var didSubmitPassword = false
-    @FocusState private var isAIPromptFocused: Bool
     @Environment(\.dismiss) private var dismiss
     
     private var deviceTypeName: String {
@@ -133,6 +132,7 @@ struct ConnectedTerminalView: View {
         }) {
             PasswordPromptView(hostname: host.hostname, username: host.username) { pw in
                 didSubmitPassword = true
+                try? KeychainService.savePassword(pw, hostID: host.id)
                 Task { await session.connect(host: host, password: pw) }
             }
         }
@@ -145,29 +145,16 @@ struct ConnectedTerminalView: View {
         }
         .task {
             if case .password = host.authMethod {
+                if let savedPassword = try? KeychainService.loadPassword(hostID: host.id),
+                   !savedPassword.isEmpty {
+                    didSubmitPassword = true
+                    await session.connect(host: host, password: savedPassword)
+                    return
+                }
                 didSubmitPassword = false
                 showPasswordPrompt = true
             } else {
                 await session.connect(host: host)
-            }
-        }
-        .onChange(of: session.inputRoutingMode) { _, mode in
-            guard session.aiToolsEnabled else { return }
-            if mode == .ai {
-                session.relinquishTerminalFocusForAI()
-                DispatchQueue.main.async {
-                    isAIPromptFocused = true
-                }
-            } else {
-                isAIPromptFocused = false
-                session.focusTerminalIfNeeded()
-            }
-        }
-        .onChange(of: session.isConnected) { _, isNowConnected in
-            guard isNowConnected, session.aiToolsEnabled, session.inputRoutingMode == .ai else { return }
-            session.relinquishTerminalFocusForAI()
-            DispatchQueue.main.async {
-                isAIPromptFocused = true
             }
         }
     }
@@ -175,7 +162,7 @@ struct ConnectedTerminalView: View {
     @ViewBuilder
     private var accessoryArea: some View {
         VStack(spacing: 0) {
-            if session.aiToolsEnabled, session.inputRoutingMode == .ai {
+            if session.aiToolsEnabled {
                 VStack(spacing: 6) {
                     if session.aiIsThinking {
                         TimelineView(.animation(minimumInterval: 0.35)) { timeline in
@@ -228,16 +215,14 @@ struct ConnectedTerminalView: View {
                     }
 
                     HStack(spacing: 8) {
-                        TextField("Ask AI or use run <command> / !<command>", text: $session.aiPromptDraft)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.callout, design: .monospaced))
-                            .submitLabel(.send)
-                            .focused($isAIPromptFocused)
-                            .onSubmit {
-                                Task { await session.submitAIPrompt() }
-                            }
-                            .disabled(session.aiIsThinking)
+                        Text("Mode: \(session.inputRoutingMode.title)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Text(session.isRoutingModeForced ? "Forced" : "Auto")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
 
+                        Spacer()
                         if session.isWarpLoggedIn {
                             Button("Logout") {
                                 session.logoutFromWarp()
@@ -249,14 +234,6 @@ struct ConnectedTerminalView: View {
                             }
                             .font(.caption.weight(.semibold))
                         }
-
-                        Button("Send") {
-                            Task { await session.submitAIPrompt() }
-                        }
-                        .disabled(
-                            session.aiIsThinking
-                                || session.aiPromptDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        )
                     }
                 }
                 .padding(.horizontal, 8)
@@ -275,7 +252,16 @@ struct ConnectedTerminalView: View {
             KeyAccessoryBar(
                 session: session,
                 accessoryState: accessoryState,
-                inputRoutingMode: $session.inputRoutingMode,
+                inputRoutingMode: Binding(
+                    get: { session.inputRoutingMode },
+                    set: { newMode in
+                        if session.isRoutingModeForced, session.inputRoutingMode == newMode {
+                            session.clearManualRoutingModeOverride()
+                        } else {
+                            session.setManualRoutingModeOverride(newMode)
+                        }
+                    }
+                ),
                 aiToolsEnabled: session.aiToolsEnabled
             ) {
                 Task { await session.disconnect(); dismiss() }

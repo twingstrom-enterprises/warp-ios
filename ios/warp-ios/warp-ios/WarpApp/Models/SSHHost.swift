@@ -13,9 +13,9 @@ struct SSHHost: Identifiable, Codable {
     var username: String
     var authMethod: AuthMethod
 
-    init(label: String, hostname: String, port: Int = 22,
+    init(id: UUID = UUID(), label: String, hostname: String, port: Int = 22,
          username: String, authMethod: AuthMethod) {
-        self.id = UUID()
+        self.id = id
         self.label = label
         self.hostname = hostname
         self.port = port

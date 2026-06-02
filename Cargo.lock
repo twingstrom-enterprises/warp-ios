@@ -15482,6 +15482,7 @@ dependencies = [
  "async-trait",
  "hex",
  "log",
+ "natural_language_detection",
  "once_cell",
  "russh",
  "russh-keys",

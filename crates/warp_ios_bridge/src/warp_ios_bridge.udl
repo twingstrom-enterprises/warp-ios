@@ -3,6 +3,13 @@ namespace warp_ios_bridge {
     // connection doesn't pay the initialization cost.
     void initialize_bridge();
 
+    [Async]
+    InputIntentClassification classify_input_intent(
+        string buffer_text,
+        string current_mode,
+        boolean is_agent_follow_up
+    );
+
     [Throws=SshError, Async]
     SshSession ssh_connect_with_password(string host, u16 port, string username, string password);
 
@@ -17,6 +24,12 @@ enum SshError {
     "ChannelError",
     "Disconnected",
     "InvalidKey",
+};
+
+dictionary InputIntentClassification {
+    string mode;
+    string source;
+    float confidence;
 };
 
 callback interface DataReceiver {

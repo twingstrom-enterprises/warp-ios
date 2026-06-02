@@ -61,14 +61,18 @@ struct AddHostView: View {
     private func save() {
         let portNum = Int(port) ?? 22
         let auth: AuthMethod
+        let hostID = UUID()
         if useKey {
             let tag = UUID().uuidString
             try? KeychainService.saveKey(keyPEM, tag: tag)
             auth = .key(keychainTag: tag)
         } else {
+            if !password.isEmpty {
+                try? KeychainService.savePassword(password, hostID: hostID)
+            }
             auth = .password
         }
-        let host = SSHHost(label: label, hostname: hostname, port: portNum,
+        let host = SSHHost(id: hostID, label: label, hostname: hostname, port: portNum,
                            username: username, authMethod: auth)
         onSave(host)
         dismiss()
