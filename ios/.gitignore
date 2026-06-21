@@ -1,7 +1,7 @@
-WarpApp/Generated/
-WarpIOSBridge.xcframework/
-*.xcworkspace/xcuserdata/
-*.xcodeproj/xcuserdata/
-*.xcodeproj/project.xcworkspace/xcuserdata/
-DerivedData/
+**/WarpApp/Generated/
+**/WarpIOSBridge.xcframework/
+**/*.xcworkspace/xcuserdata/
+**/*.xcodeproj/xcuserdata/
+**/*.xcodeproj/project.xcworkspace/xcuserdata/
+**/DerivedData/
 .DS_Store
