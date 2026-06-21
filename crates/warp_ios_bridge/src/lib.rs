@@ -1438,6 +1438,7 @@ elif [ -n "${BASH_VERSION:-}" ]; then
     [ "$__warp_ios_in_prompt" = "1" ] && return
     case "$BASH_COMMAND" in
       __warp_ios_*|history*|trap*|PROMPT_COMMAND*) return ;;
+      --color=auto|--color=*) return ;;
     esac
     __warp_ios_emit_preexec "$BASH_COMMAND"
   }
