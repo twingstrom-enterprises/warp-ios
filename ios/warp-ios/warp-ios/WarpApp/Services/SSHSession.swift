@@ -459,9 +459,9 @@ class SSHSession {
     }
 
     func shouldSuppressPromptOutput() -> Bool {
-        blockStore.isBootstrapped
-            && !blockStore.fallbackModeEnabled
-            && promptFeedState != .interactive
+        // Block mode owns prompt rendering locally; remote readline redraws (CR/EL)
+        // break when the prompt wraps in our small prompt-only terminal view.
+        blockStore.isBootstrapped && !blockStore.fallbackModeEnabled
     }
 
     func recordPromptOutputPath(dataCount: Int, suppressed: Bool) {
@@ -499,6 +499,11 @@ class SSHSession {
     }
 
     private func renderSyntheticPromptInTerminal() {
+        renderPromptWithInput(currentInputBuffer)
+    }
+
+    private func renderSyntheticPromptIfNeeded() {
+        guard blockStore.isBootstrapped, !blockStore.fallbackModeEnabled else { return }
         renderPromptWithInput(currentInputBuffer)
     }
 
@@ -657,6 +662,7 @@ class SSHSession {
                 currentInputBuffer.removeLast()
             }
             scheduleInputModeAutoDetection()
+            renderSyntheticPromptIfNeeded()
             return
         }
 
@@ -667,6 +673,7 @@ class SSHSession {
         if let typed = String(bytes: bytes, encoding: .utf8), !typed.isEmpty {
             currentInputBuffer.append(typed)
             scheduleInputModeAutoDetection()
+            renderSyntheticPromptIfNeeded()
         }
     }
 
