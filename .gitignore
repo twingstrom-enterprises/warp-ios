@@ -69,6 +69,3 @@ __pycache__/
 
 # Project notes
 .note/
-
-# Local Xcode Cloud scripts (not used in this repo layout)
-ci_scripts/
