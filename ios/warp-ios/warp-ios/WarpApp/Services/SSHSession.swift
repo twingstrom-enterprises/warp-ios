@@ -364,18 +364,7 @@ class SSHSession {
     }
 
     func generateDialogueFromWarpAI(prompt: String) async throws -> String {
-        do {
-            return try await warpAIBackendClient.generateAgentReply(from: prompt)
-        } catch {
-            let message = error.localizedDescription.lowercased()
-            if message.contains("not ready") || message.contains("timed out") || message.contains("pending") {
-                trace("agent-run path not ready; skipping legacy fallback error=\(error.localizedDescription)")
-                throw error
-            }
-            trace("agent-run path failed; falling back to GenerateDialogue error=\(error.localizedDescription)")
-            blockStore.applyStatus("Agent chat path unavailable (\(error.localizedDescription)). Falling back to legacy dialogue endpoint.")
-            return try await warpAIBackendClient.generateDialogue(from: prompt)
-        }
+        try await warpAIBackendClient.generateAgentReply(from: prompt)
     }
 
     func requestRichHistory() {
@@ -948,7 +937,6 @@ final class IOSAIActionOrchestrator {
                 return
             }
             let dialoguePath = shouldUseDialogue(for: prompt)
-            let fileSearchLike = looksLikeFileSearchPrompt(prompt)
             if dialoguePath {
                 do {
                     let answer = try await session.generateDialogueFromWarpAI(prompt: prompt)
@@ -968,8 +956,12 @@ final class IOSAIActionOrchestrator {
                     let lower = error.localizedDescription.lowercased()
                     if lower.contains("not ready") || lower.contains("timed out") || lower.contains("pending") {
                         session.blockStore.applyStatus(
-                            "Warp agent is still spinning up (state pending/claimed). " +
-                            "Please retry in a few seconds."
+                            "Warp agent is still spinning up. Please retry in a few seconds."
+                        )
+                    } else if lower.contains("oz harness") || lower.contains("agent run failed") {
+                        session.blockStore.applyStatus(
+                            "Warp agent hit a backend error and could not answer. " +
+                            "Please retry — a fresh agent session will start automatically."
                         )
                     } else {
                         session.blockStore.applyStatus("Warp AI dialogue failed: \(error.localizedDescription)")
@@ -1217,20 +1209,31 @@ final class IOSAIActionOrchestrator {
     }
 
     private func isProgrammingOnlyGuardrail(_ answer: String) -> Bool {
-        let normalized = answer.lowercased()
-        let needles = [
-            "programming-related questions",
-            "computer programming questions",
-            "questions in that domain",
-            "if you have any queries related to that"
-        ]
-        return needles.contains(where: { normalized.contains($0) })
+        WarpAIDialogueQuality.isProgrammingOnlyGuardrail(answer)
     }
 }
 
 struct WarpGeneratedCommand {
     let command: String
     let description: String
+}
+
+private enum WarpAIDialogueQuality {
+    static func isProgrammingOnlyGuardrail(_ answer: String) -> Bool {
+        let normalized = answer.lowercased()
+        let needles = [
+            "programming-related questions",
+            "computer programming questions",
+            "questions in that domain",
+            "if you have any queries related to that",
+            "queries related to coding",
+            "feel free to ask",
+            "i'm here to help with programming",
+            "i'm here to provide information and assistance related to computer programming",
+            "if you have any questions in that domain"
+        ]
+        return needles.contains(where: { normalized.contains($0) })
+    }
 }
 
 private struct WarpRequestContext: Encodable {
@@ -1590,7 +1593,7 @@ final class WarpAIBackendClient {
         let token = try await authService.validBearerToken()
         trace("GenerateDialogue start prompt_chars=\(prompt.count) prompt_preview='\(preview(prompt))'")
         let firstAnswer = try await generateDialogueOnce(prompt: prompt, token: token)
-        if isLowQualityDialogueAnswer(firstAnswer) {
+        if WarpAIDialogueQuality.isProgrammingOnlyGuardrail(firstAnswer) {
             let reframedPrompt =
                 """
                 Please answer the user's question directly and helpfully in plain language.
@@ -1599,6 +1602,9 @@ final class WarpAIBackendClient {
                 """
             trace("GenerateDialogue retry due_to=low_quality first_answer_preview='\(preview(firstAnswer))'")
             let retried = try await generateDialogueOnce(prompt: reframedPrompt, token: token)
+            if WarpAIDialogueQuality.isProgrammingOnlyGuardrail(retried) {
+                throw WarpAuthError.aiRequestFailed("legacy dialogue endpoint returned programming-only guardrail")
+            }
             return retried
         }
         return firstAnswer
@@ -1653,15 +1659,14 @@ final class WarpAIBackendClient {
         return answer
     }
 
-    private func isLowQualityDialogueAnswer(_ answer: String) -> Bool {
-        let normalized = answer.lowercased()
-        let boilerplateNeedles = [
-            "i'm here to help with programming-related questions",
-            "i'm here to provide information and assistance related to computer programming",
-            "if you have any questions in that domain",
-            "feel free to ask"
-        ]
-        return boilerplateNeedles.contains(where: { normalized.contains($0) })
+    private func resetAgentSession(reason: String) {
+        agentRunID = nil
+        agentTaskID = nil
+        pendingAgentPrompt = nil
+        lastAgentAssistantFingerprint = nil
+        lastAgentMessageID = nil
+        lastConversationPayloadByteCount = nil
+        trace("AgentRun session reset reason=\(reason)")
     }
 
     private func fetchRequestLimitInfo(token: String) async throws -> RequestLimitInfoResponse? {
@@ -1753,12 +1758,10 @@ final class WarpAIBackendClient {
         token: String,
         expectedPrompt: String
     ) async throws -> String {
-        let timeoutNs: UInt64 = 30 * 1_000_000_000
+        let timeoutNs: UInt64 = 45 * 1_000_000_000
         let pollNs: UInt64 = 750_000_000
-        let maxNotReadyAttempts = 12
         let start = DispatchTime.now().uptimeNanoseconds
         var attempts = 0
-        var notReadyAttempts = 0
 
         while DispatchTime.now().uptimeNanoseconds - start < timeoutNs {
             attempts += 1
@@ -1766,8 +1769,6 @@ final class WarpAIBackendClient {
             if let data,
                let conversation = try? JSONSerialization.jsonObject(with: data),
                let candidate = extractLatestAssistantMessage(from: conversation, expectedPrompt: expectedPrompt) {
-                let normalizedExpected = normalizePromptForMatching(expectedPrompt)
-                let normalizedCandidate = normalizePromptForMatching(candidate.text)
                 let fingerprint = "\(candidate.id ?? "no-id"):\(candidate.text)"
                 if fingerprint != lastAgentAssistantFingerprint {
                     lastAgentAssistantFingerprint = fingerprint
@@ -1784,8 +1785,6 @@ final class WarpAIBackendClient {
                         .replacingOccurrences(of: "\n", with: " ")
                     trace("AgentRun conversation parse_miss bytes=\(data.count) preview='\(preview)'")
                 }
-            } else {
-                notReadyAttempts += 1
             }
 
             if let metadataConversationReply = try await pollConversationViaRunMetadata(
@@ -1801,13 +1800,10 @@ final class WarpAIBackendClient {
                 return messageReply
             }
 
-            if notReadyAttempts >= maxNotReadyAttempts {
-                throw WarpAuthError.aiRequestFailed("agent conversation not ready yet")
-            }
-
             try await Task.sleep(nanoseconds: pollNs)
         }
 
+        resetAgentSession(reason: "poll_timeout")
         throw WarpAuthError.aiRequestFailed("agent run timed out waiting for assistant reply")
     }
 
@@ -1834,6 +1830,7 @@ final class WarpAIBackendClient {
                     "status_message='\(runStatus.statusMessage ?? "none")'"
                 )
                 if runStatus.isTerminalFailure {
+                    resetAgentSession(reason: "terminal_failure")
                     throw WarpAuthError.aiRequestFailed(
                         "agent run failed: \(runStatus.statusMessage ?? "terminal state without response")"
                     )
