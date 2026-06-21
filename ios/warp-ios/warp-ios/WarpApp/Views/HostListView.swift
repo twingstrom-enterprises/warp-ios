@@ -4,6 +4,7 @@ import UIKit
 struct HostListView: View {
     @State private var hosts: [SSHHost] = SSHHost.loadAll()
     @State private var showingAddHost = false
+    @State private var editingHost: SSHHost?
     @State private var selectedHost: SSHHost?
 
     private var deviceTypeName: String {
@@ -26,6 +27,14 @@ struct HostListView: View {
                             Text("\(host.username)@\(host.hostname):\(host.port)")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
+                    }
+                    .swipeActions(edge: .leading) {
+                        Button {
+                            editingHost = host
+                        } label: {
+                            Label("Edit", systemImage: "pencil")
+                        }
+                        .tint(.blue)
                     }
                 }
                 .onDelete { indexSet in
@@ -61,6 +70,14 @@ struct HostListView: View {
                 AddHostView { newHost in
                     hosts.append(newHost)
                     SSHHost.saveAll(hosts)
+                }
+            }
+            .sheet(item: $editingHost) { host in
+                AddHostView(host: host) { updatedHost in
+                    if let index = hosts.firstIndex(where: { $0.id == updatedHost.id }) {
+                        hosts[index] = updatedHost
+                        SSHHost.saveAll(hosts)
+                    }
                 }
             }
             .fullScreenCover(item: $selectedHost) { host in
