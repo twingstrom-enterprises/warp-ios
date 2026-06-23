@@ -69,10 +69,19 @@ No secrets are committed to the repo.
 2. Runs `scripts/build_ios_xcframework.sh` (Rust bridge + UniFFI Swift bindings)
 3. Writes the App Store Connect API `.p8` key to a temp file for `xcodebuild` authentication
 4. Imports the Apple Distribution certificate (`.p12`) into the ephemeral keychain
-5. Downloads an App Store provisioning profile for `twingstrom-enterprises.warp-ios.dev`
-6. Archives with `xcodebuild` using manual signing (`Apple Distribution` + downloaded profile) and ASC API auth flags (`-authenticationKeyID`, `-authenticationKeyIssuerID`, `-authenticationKeyPath`, `-allowProvisioningUpdates`) so no Xcode Accounts login is required
-7. Exports an IPA with the same ASC API auth flags
-8. Uploads to TestFlight via `apple-actions/upload-testflight-build`
+5. Archives with `xcodebuild` using **automatic signing** (`CODE_SIGN_STYLE=Automatic`) and ASC API auth flags (`-authenticationKeyID`, `-authenticationKeyIssuerID`, `-authenticationKeyPath`, `-allowProvisioningUpdates`) so Xcode creates/updates the App Store provisioning profile without an Accounts login
+6. Exports an IPA with automatic signing (see `ios/ExportOptions.plist`)
+7. Uploads to TestFlight via `apple-actions/upload-testflight-build`
+
+### Code signing approach
+
+CI uses **automatic signing** scoped to the app target only. The workflow does **not** pass `PROVISIONING_PROFILE` on the `xcodebuild` command line — doing so applies the profile to every target in the scheme, including SPM packages like SwiftTerm that cannot use provisioning profiles.
+
+Instead:
+
+- The imported **Apple Distribution** `.p12` supplies the signing certificate.
+- The **App Store Connect API key** plus `-allowProvisioningUpdates` lets `xcodebuild` fetch or regenerate the App Store provisioning profile for `twingstrom-enterprises.warp-ios.dev`.
+- SPM dependency targets are signed automatically without a provisioning profile.
 
 ## Local verification
 
@@ -90,7 +99,7 @@ Archive locally in Xcode (**Product → Archive**) to validate signing outside C
 
 ## Limitations
 
-- **Distribution certificate required:** App Store Connect API keys can download provisioning profiles but cannot replace a distribution certificate. You must provide the `.p12` secrets above.
+- **Distribution certificate required:** App Store Connect API keys can manage provisioning profiles but cannot replace a distribution certificate. You must provide the `.p12` secrets above. If archive fails with a certificate/profile mismatch, re-export the `.p12` from the **Apple Distribution** certificate that matches your team (`88GH3J5VCZ`) in [Apple Developer → Certificates](https://developer.apple.com/account/resources/certificates/list).
 - **First upload:** App Store Connect must already have the app record for bundle ID `twingstrom-enterprises.warp-ios.dev`.
 - **Processing time:** TestFlight builds may take several minutes to process after upload; the workflow does not wait for Apple processing to finish.
 - **Path filters:** Changes outside the listed paths (e.g. only desktop Rust crates) do not trigger a deploy even if they indirectly affect the bridge.
