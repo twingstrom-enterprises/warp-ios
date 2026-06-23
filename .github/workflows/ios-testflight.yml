@@ -105,10 +105,26 @@ jobs:
           echo "CFBundleShortVersionString (MARKETING_VERSION)=$MARKETING_VERSION"
           echo "CFBundleVersion (CURRENT_PROJECT_VERSION)=$BUILD_NUMBER"
 
+      - name: Resolve provisioning profile
+        id: profile
+        run: |
+          PROFILES='${{ steps.provisioning.outputs.profiles }}'
+          PROFILE_UUID=$(echo "$PROFILES" | jq -r '.[0].udid')
+          PROFILE_NAME=$(echo "$PROFILES" | jq -r '.[0].name')
+          if [ -z "$PROFILE_UUID" ] || [ "$PROFILE_UUID" = "null" ]; then
+            echo "::error::Failed to resolve provisioning profile UUID from download step"
+            echo "profiles=$PROFILES"
+            exit 1
+          fi
+          echo "uuid=$PROFILE_UUID" >> "$GITHUB_OUTPUT"
+          echo "name=$PROFILE_NAME" >> "$GITHUB_OUTPUT"
+          echo "Using provisioning profile: $PROFILE_NAME ($PROFILE_UUID)"
+
       - name: Archive iOS app
         env:
           MARKETING_VERSION: ${{ steps.app_version.outputs.marketing_version }}
           BUILD_NUMBER: ${{ steps.app_version.outputs.build_number }}
+          PROFILE_UUID: ${{ steps.profile.outputs.uuid }}
         run: |
           xcodebuild archive \
             -project "$XCODE_PROJECT" \
@@ -123,7 +139,7 @@ jobs:
             DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Distribution" \
-            PROVISIONING_PROFILE_SPECIFIER="${{ steps.provisioning.outputs.profiles }}" \
+            PROVISIONING_PROFILE="$PROFILE_UUID" \
             MARKETING_VERSION="$MARKETING_VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
@@ -147,11 +163,19 @@ jobs:
           fi
 
       - name: Export IPA
+        env:
+          PROFILE_UUID: ${{ steps.profile.outputs.uuid }}
         run: |
+          EXPORT_OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
+          cp ios/ExportOptions.plist "$EXPORT_OPTIONS"
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" "$EXPORT_OPTIONS" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:$BUNDLE_ID string $PROFILE_UUID" "$EXPORT_OPTIONS" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :provisioningProfiles:$BUNDLE_ID $PROFILE_UUID" "$EXPORT_OPTIONS"
+
           xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/warp-ios.xcarchive" \
             -exportPath "$RUNNER_TEMP/export" \
-            -exportOptionsPlist ios/ExportOptions.plist \
+            -exportOptionsPlist "$EXPORT_OPTIONS" \
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
             -authenticationKeyPath "$ASC_KEY_PATH" \
