@@ -3,7 +3,7 @@ name: iOS TestFlight
 on:
   push:
     branches:
-      - master
+      - main
     paths:
       - 'ios/**'
       - 'crates/warp_ios_bridge/**'
@@ -24,6 +24,8 @@ env:
   BUNDLE_ID: twingstrom-enterprises.warp-ios.dev
   DEVELOPMENT_TEAM: 88GH3J5VCZ
   MARKETING_VERSION: '1.4'
+  ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+  ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
 
 jobs:
   deploy-testflight:
@@ -43,22 +45,28 @@ jobs:
       - name: Build Rust iOS bridge
         run: bash scripts/build_ios_xcframework.sh
 
-      - name: Resolve App Store Connect API private key
+      - name: Install App Store Connect API key
         id: asc_key
         env:
           APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
         run: |
+          ASC_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
           if [ -z "$APP_STORE_CONNECT_API_KEY" ]; then
             echo "::error::Missing secret APP_STORE_CONNECT_API_KEY"
             exit 1
           fi
-          if printf '%s' "$APP_STORE_CONNECT_API_KEY" | grep -q 'BEGIN PRIVATE KEY'; then
-            printf '%s\n' "$APP_STORE_CONNECT_API_KEY" > "$RUNNER_TEMP/AuthKey.p8"
-          else
-            printf '%s' "$APP_STORE_CONNECT_API_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          if [ -z "$ASC_KEY_ID" ] || [ -z "$ASC_ISSUER_ID" ]; then
+            echo "::error::Missing APP_STORE_CONNECT_API_KEY_ID or APP_STORE_CONNECT_API_ISSUER_ID secrets"
+            exit 1
           fi
+          if printf '%s' "$APP_STORE_CONNECT_API_KEY" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s\n' "$APP_STORE_CONNECT_API_KEY" > "$ASC_KEY_PATH"
+          else
+            printf '%s' "$APP_STORE_CONNECT_API_KEY" | base64 --decode > "$ASC_KEY_PATH"
+          fi
+          echo "ASC_KEY_PATH=$ASC_KEY_PATH" >> "$GITHUB_ENV"
           echo "key<<EOF" >> "$GITHUB_OUTPUT"
-          cat "$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_OUTPUT"
+          cat "$ASC_KEY_PATH" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Import code signing certificate
@@ -68,12 +76,13 @@ jobs:
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
       - name: Download App Store provisioning profile
+        id: provisioning
         uses: apple-actions/download-provisioning-profiles@c0047984c626d0c444c6b6018b92fcbe74eaf7b5 # v4
         with:
           bundle-id: ${{ env.BUNDLE_ID }}
           profile-type: IOS_APP_STORE
-          issuer-id: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
-          api-key-id: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          issuer-id: ${{ env.ASC_ISSUER_ID }}
+          api-key-id: ${{ env.ASC_KEY_ID }}
           api-private-key: ${{ steps.asc_key.outputs.key }}
 
       - name: Archive iOS app
@@ -86,11 +95,16 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/warp-ios.xcarchive" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -allowProvisioningUpdates \
             DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
-            CODE_SIGN_STYLE=Automatic \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ steps.provisioning.outputs.profiles }}" \
             MARKETING_VERSION="$MARKETING_VERSION" \
-            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
-            -allowProvisioningUpdates
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
       - name: Export IPA
         run: |
@@ -98,6 +112,9 @@ jobs:
             -archivePath "$RUNNER_TEMP/warp-ios.xcarchive" \
             -exportPath "$RUNNER_TEMP/export" \
             -exportOptionsPlist ios/ExportOptions.plist \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
             -allowProvisioningUpdates
 
       - name: Upload to TestFlight
@@ -105,7 +122,7 @@ jobs:
         with:
           app-path: ${{ runner.temp }}/export/warp-ios.ipa
           app-type: ios
-          issuer-id: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
-          api-key-id: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          issuer-id: ${{ env.ASC_ISSUER_ID }}
+          api-key-id: ${{ env.ASC_KEY_ID }}
           api-private-key: ${{ steps.asc_key.outputs.key }}
           release-notes: 'Build ${{ github.run_number }} from ${{ github.sha }}'

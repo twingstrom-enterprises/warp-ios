@@ -1,12 +1,12 @@
 # iOS TestFlight Deployment
 
-GitHub Actions deploys the Warp iOS app to TestFlight when iOS-related changes merge to `master`.
+GitHub Actions deploys the Warp iOS app to TestFlight when iOS-related changes merge to `main`.
 
 Workflow: [`.github/workflows/ios-testflight.yml`](../.github/workflows/ios-testflight.yml)
 
 ## Triggers
 
-- **Automatic:** push to `master` when any of these change:
+- **Automatic:** push to `main` when any of these change:
   - `ios/**`
   - `crates/warp_ios_bridge/**`
   - `scripts/build_ios_xcframework.sh`
@@ -42,9 +42,12 @@ No secrets are committed to the repo.
 
 1. Installs Rust 1.92.0 with iOS targets
 2. Runs `scripts/build_ios_xcframework.sh` (Rust bridge + UniFFI Swift bindings)
-3. Imports the distribution certificate and downloads an App Store provisioning profile via the API key
-4. Archives with `xcodebuild` for a generic iOS device
-5. Exports an IPA and uploads to TestFlight via `apple-actions/upload-testflight-build`
+3. Writes the App Store Connect API `.p8` key to a temp file for `xcodebuild` authentication
+4. Imports the Apple Distribution certificate (`.p12`) into the ephemeral keychain
+5. Downloads an App Store provisioning profile for `twingstrom-enterprises.warp-ios.dev`
+6. Archives with `xcodebuild` using manual signing (`Apple Distribution` + downloaded profile) and ASC API auth flags (`-authenticationKeyID`, `-authenticationKeyIssuerID`, `-authenticationKeyPath`, `-allowProvisioningUpdates`) so no Xcode Accounts login is required
+7. Exports an IPA with the same ASC API auth flags
+8. Uploads to TestFlight via `apple-actions/upload-testflight-build`
 
 ## Local verification
 
