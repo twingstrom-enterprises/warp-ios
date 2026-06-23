@@ -13,6 +13,11 @@ on:
       - 'rust-toolchain.toml'
       - '.github/workflows/ios-testflight.yml'
   workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: 'Marketing version override (CFBundleShortVersionString). Leave empty to use project.pbxproj.'
+        required: false
+        type: string
 
 concurrency:
   group: ios-testflight-${{ github.ref }}
@@ -23,7 +28,6 @@ env:
   SCHEME: warp-ios
   BUNDLE_ID: twingstrom-enterprises.warp-ios.dev
   DEVELOPMENT_TEAM: 88GH3J5VCZ
-  MARKETING_VERSION: '1.4'
   ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
   ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
 
@@ -85,9 +89,26 @@ jobs:
           api-key-id: ${{ env.ASC_KEY_ID }}
           api-private-key: ${{ steps.asc_key.outputs.key }}
 
+      - name: Resolve app version
+        id: app_version
+        env:
+          INPUT_MARKETING: ${{ inputs.marketing_version }}
+        run: |
+          if [ -n "$INPUT_MARKETING" ]; then
+            MARKETING_VERSION="$INPUT_MARKETING"
+          else
+            MARKETING_VERSION=$(awk -F'= *|;' '/MARKETING_VERSION/ {print $2; exit}' ios/warp-ios/warp-ios.xcodeproj/project.pbxproj | tr -d ' ')
+          fi
+          BUILD_NUMBER="${{ github.run_number }}"
+          echo "marketing_version=$MARKETING_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "CFBundleShortVersionString (MARKETING_VERSION)=$MARKETING_VERSION"
+          echo "CFBundleVersion (CURRENT_PROJECT_VERSION)=$BUILD_NUMBER"
+
       - name: Archive iOS app
         env:
-          BUILD_NUMBER: ${{ github.run_number }}
+          MARKETING_VERSION: ${{ steps.app_version.outputs.marketing_version }}
+          BUILD_NUMBER: ${{ steps.app_version.outputs.build_number }}
         run: |
           xcodebuild archive \
             -project "$XCODE_PROJECT" \
@@ -105,6 +126,25 @@ jobs:
             PROVISIONING_PROFILE_SPECIFIER="${{ steps.provisioning.outputs.profiles }}" \
             MARKETING_VERSION="$MARKETING_VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+
+      - name: Verify archived app version
+        env:
+          MARKETING_VERSION: ${{ steps.app_version.outputs.marketing_version }}
+          BUILD_NUMBER: ${{ steps.app_version.outputs.build_number }}
+        run: |
+          APP_PLIST="$RUNNER_TEMP/warp-ios.xcarchive/Products/Applications/warp-ios.app/Info.plist"
+          ARCHIVED_SHORT=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PLIST")
+          ARCHIVED_BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PLIST")
+          echo "Archived CFBundleShortVersionString=$ARCHIVED_SHORT"
+          echo "Archived CFBundleVersion=$ARCHIVED_BUILD"
+          if [ "$ARCHIVED_SHORT" != "$MARKETING_VERSION" ]; then
+            echo "::error::Expected CFBundleShortVersionString=$MARKETING_VERSION but archive has $ARCHIVED_SHORT"
+            exit 1
+          fi
+          if [ "$ARCHIVED_BUILD" != "$BUILD_NUMBER" ]; then
+            echo "::error::Expected CFBundleVersion=$BUILD_NUMBER but archive has $ARCHIVED_BUILD"
+            exit 1
+          fi
 
       - name: Export IPA
         run: |
@@ -125,4 +165,4 @@ jobs:
           issuer-id: ${{ env.ASC_ISSUER_ID }}
           api-key-id: ${{ env.ASC_KEY_ID }}
           api-private-key: ${{ steps.asc_key.outputs.key }}
-          release-notes: 'Build ${{ github.run_number }} from ${{ github.sha }}'
+          release-notes: 'v${{ steps.app_version.outputs.marketing_version }} (${{ steps.app_version.outputs.build_number }}) — ${{ github.sha }}'

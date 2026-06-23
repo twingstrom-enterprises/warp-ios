@@ -12,9 +12,34 @@ Workflow: [`.github/workflows/ios-testflight.yml`](../.github/workflows/ios-test
   - `scripts/build_ios_xcframework.sh`
   - `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`
   - the workflow file itself
-- **Manual:** Actions → *iOS TestFlight* → *Run workflow*
+- **Manual:** Actions → *iOS TestFlight* → *Run workflow* (optional `marketing_version` input overrides `project.pbxproj`)
 
-Build numbers use `github.run_number` so each upload gets a unique `CFBundleVersion`.
+## Versioning (TestFlight updates)
+
+Apple uses two version fields. CI must set both explicitly at archive time so TestFlight treats each release as an update testers can install.
+
+| Xcode setting | Info.plist key | Role |
+|---------------|----------------|------|
+| `MARKETING_VERSION` | `CFBundleShortVersionString` | User-visible version (e.g. `1.4`). **Must increase** when you want testers to see a new app version in TestFlight. |
+| `CURRENT_PROJECT_VERSION` | `CFBundleVersion` | Build number (e.g. `3`). **Must increase** for every upload with the same marketing version. |
+
+**When to bump what**
+
+- **Bump `MARKETING_VERSION`** (in `ios/warp-ios/warp-ios.xcodeproj/project.pbxproj` Debug + Release) when shipping a new TestFlight *version* — e.g. testers are on `1.3` and you want them notified about `1.4`. CI reads this from `project.pbxproj` unless you pass a manual `marketing_version` workflow input.
+- **Do not hardcode the build number.** CI sets `CURRENT_PROJECT_VERSION` from `github.run_number`, which auto-increments on every workflow run (1, 2, 3, …). Never set it to a fixed value like `1` in the workflow.
+- If TestFlight “quietly publishes” without notifying testers, the marketing version likely did not increase above what they already have installed.
+
+The archive step passes `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` to `xcodebuild`, then a **Verify archived app version** step reads them back from the `.xcarchive` and fails the job if they do not match.
+
+### Verify version after upload
+
+1. **CI logs:** open the *Resolve app version* and *Verify archived app version* steps — they print `CFBundleShortVersionString` and `CFBundleVersion`.
+2. **TestFlight:** App Store Connect → your app → TestFlight → select the build; version and build number appear in the build details.
+3. **Local IPA inspection:**
+   ```bash
+   unzip -p path/to/warp-ios.ipa Payload/warp-ios.app/Info.plist | plutil -p -
+   ```
+   Look for `CFBundleShortVersionString` and `CFBundleVersion`.
 
 ## One-time App Store Connect setup
 
