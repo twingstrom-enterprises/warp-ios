@@ -57,7 +57,7 @@ final class TerminalBlockStore {
     }
 
     func applyPreexec(command: String, blockId: UInt64, metadata: CommandExecutionMetadata?) {
-        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = Self.normalizeCommand(command)
         guard !trimmed.isEmpty else { return }
         commandHistory.append(trimmed)
 
@@ -184,6 +184,29 @@ final class TerminalBlockStore {
             lines.append("exit code: \(exitCode)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    static func normalizeCommand(_ command: String) -> String {
+        var normalized = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return "" }
+
+        // Bash preexec reports alias-expanded `ls --color=auto`, sometimes duplicated
+        // when replayed from history. Show users the command they typed.
+        if normalized == "ls --color=auto" {
+            return "ls"
+        }
+        if normalized.hasPrefix("ls ") {
+            let tokens = normalized.split(whereSeparator: \.isWhitespace)
+            if tokens.first == "ls" {
+                let filtered = tokens.filter { $0 != "--color=auto" }
+                if filtered.count == 1 {
+                    return "ls"
+                }
+                normalized = filtered.joined(separator: " ")
+            }
+        }
+
+        return normalized
     }
 
     private func sanitizeOutputChunk(_ raw: String) -> String {

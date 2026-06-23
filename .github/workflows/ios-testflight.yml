@@ -1,0 +1,111 @@
+name: iOS TestFlight
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'ios/**'
+      - 'crates/warp_ios_bridge/**'
+      - 'scripts/build_ios_xcframework.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/ios-testflight.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ios-testflight-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  XCODE_PROJECT: ios/warp-ios/warp-ios.xcodeproj
+  SCHEME: warp-ios
+  BUNDLE_ID: twingstrom-enterprises.warp-ios.dev
+  DEVELOPMENT_TEAM: 88GH3J5VCZ
+  MARKETING_VERSION: '1.4'
+
+jobs:
+  deploy-testflight:
+    name: Build and upload to TestFlight
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.92.0
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Build Rust iOS bridge
+        run: bash scripts/build_ios_xcframework.sh
+
+      - name: Resolve App Store Connect API private key
+        id: asc_key
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          if [ -z "$APP_STORE_CONNECT_API_KEY" ]; then
+            echo "::error::Missing secret APP_STORE_CONNECT_API_KEY"
+            exit 1
+          fi
+          if printf '%s' "$APP_STORE_CONNECT_API_KEY" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s\n' "$APP_STORE_CONNECT_API_KEY" > "$RUNNER_TEMP/AuthKey.p8"
+          else
+            printf '%s' "$APP_STORE_CONNECT_API_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          fi
+          echo "key<<EOF" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Import code signing certificate
+        uses: apple-actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d # v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Download App Store provisioning profile
+        uses: apple-actions/download-provisioning-profiles@c0047984c626d0c444c6b6018b92fcbe74eaf7b5 # v4
+        with:
+          bundle-id: ${{ env.BUNDLE_ID }}
+          profile-type: IOS_APP_STORE
+          issuer-id: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          api-key-id: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          api-private-key: ${{ steps.asc_key.outputs.key }}
+
+      - name: Archive iOS app
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          xcodebuild archive \
+            -project "$XCODE_PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/warp-ios.xcarchive" \
+            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+            CODE_SIGN_STYLE=Automatic \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            -allowProvisioningUpdates
+
+      - name: Export IPA
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/warp-ios.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist ios/ExportOptions.plist \
+            -allowProvisioningUpdates
+
+      - name: Upload to TestFlight
+        uses: apple-actions/upload-testflight-build@e15af57a639abb7e91f0651338f0ff4154cdaf5e # v4
+        with:
+          app-path: ${{ runner.temp }}/export/warp-ios.ipa
+          app-type: ios
+          issuer-id: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          api-key-id: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          api-private-key: ${{ steps.asc_key.outputs.key }}
+          release-notes: 'Build ${{ github.run_number }} from ${{ github.sha }}'

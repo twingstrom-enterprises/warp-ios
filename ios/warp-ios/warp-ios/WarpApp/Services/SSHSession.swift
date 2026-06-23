@@ -93,6 +93,7 @@ class SSHSession {
         case awaitingPrecmd
     }
     private var promptFeedState: PromptFeedState = .interactive
+    private var remoteTabCompletionActive = false
 
     init() {
         refreshWarpAuthState()
@@ -240,6 +241,19 @@ class SSHSession {
             renderSyntheticPromptInTerminal()
             submitPromptFromTerminal(prompt)
             return true
+        }
+
+        if isTab(bytes), blockStore.isBootstrapped, !blockStore.fallbackModeEnabled {
+            remoteTabCompletionActive = true
+            trace("tab completion passthrough enabled")
+            return false
+        }
+
+        if remoteTabCompletionActive {
+            if isTab(bytes) || isArrowKey(bytes) || isBackspace(bytes) || isEscape(bytes) {
+                return false
+            }
+            finishRemoteTabCompletion()
         }
 
         updateCurrentInputBuffer(for: bytes)
@@ -414,6 +428,7 @@ class SSHSession {
         persistTypingHistory()
         richHistoryVisible = false
         currentInputBuffer = ""
+        remoteTabCompletionActive = false
         promptFeedState = .runningBlock
         awaitingRemotePromptEcho = false
         if blockStore.isBootstrapped, !blockStore.fallbackModeEnabled {
@@ -444,6 +459,7 @@ class SSHSession {
 
     func handlePrecmdEvent() {
         currentInputBuffer = ""
+        remoteTabCompletionActive = false
         promptFeedState = .interactive
         awaitingRemotePromptEcho = true
         renderSyntheticPromptInTerminal()
@@ -459,9 +475,10 @@ class SSHSession {
     }
 
     func shouldSuppressPromptOutput() -> Bool {
-        blockStore.isBootstrapped
-            && !blockStore.fallbackModeEnabled
-            && promptFeedState != .interactive
+        // Block mode owns prompt rendering locally; remote readline redraws (CR/EL)
+        // break when the prompt wraps in our small prompt-only terminal view.
+        guard blockStore.isBootstrapped, !blockStore.fallbackModeEnabled else { return false }
+        return !remoteTabCompletionActive
     }
 
     func recordPromptOutputPath(dataCount: Int, suppressed: Bool) {
@@ -499,6 +516,11 @@ class SSHSession {
     }
 
     private func renderSyntheticPromptInTerminal() {
+        renderPromptWithInput(currentInputBuffer)
+    }
+
+    private func renderSyntheticPromptIfNeeded() {
+        guard blockStore.isBootstrapped, !blockStore.fallbackModeEnabled else { return }
         renderPromptWithInput(currentInputBuffer)
     }
 
@@ -563,6 +585,31 @@ class SSHSession {
         richHistorySelectionIndex = 0
         richHistoryOriginalBuffer = ""
         currentInputBuffer = ""
+        remoteTabCompletionActive = false
+    }
+
+    private func finishRemoteTabCompletion() {
+        guard remoteTabCompletionActive else { return }
+        remoteTabCompletionActive = false
+        syncCurrentInputBufferFromTerminal()
+        trace("tab completion passthrough disabled input='\(currentInputBuffer)'")
+    }
+
+    private func syncCurrentInputBufferFromTerminal() {
+        guard let terminalView else { return }
+        let terminal = terminalView.getTerminal()
+        let cursorRow = min(terminal.getCursorLocation().y, terminal.rows - 1)
+        guard cursorRow >= 0 else { return }
+
+        let combined = (0...cursorRow)
+            .compactMap { terminal.getLine(row: $0)?.translateToString(trimRight: true) }
+            .joined()
+        let prefix = promptPrefix()
+        if combined.hasPrefix(prefix) {
+            currentInputBuffer = String(combined.dropFirst(prefix.count))
+        } else if let promptRange = combined.range(of: prefix, options: .backwards) {
+            currentInputBuffer = String(combined[promptRange.upperBound...])
+        }
     }
 
     private func openOrAdvanceRichHistory() {
@@ -657,6 +704,7 @@ class SSHSession {
                 currentInputBuffer.removeLast()
             }
             scheduleInputModeAutoDetection()
+            renderSyntheticPromptIfNeeded()
             return
         }
 
@@ -667,6 +715,7 @@ class SSHSession {
         if let typed = String(bytes: bytes, encoding: .utf8), !typed.isEmpty {
             currentInputBuffer.append(typed)
             scheduleInputModeAutoDetection()
+            renderSyntheticPromptIfNeeded()
         }
     }
 
@@ -763,26 +812,7 @@ class SSHSession {
     }
 
     private func normalizeHistoryCommand(_ command: String) -> String {
-        var normalized = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else { return "" }
-
-        // Bash preexec reports alias-expanded `ls --color=auto`, sometimes duplicated
-        // when replayed. Normalize history entries back to what users expect to recall.
-        if normalized == "ls --color=auto" {
-            return "ls"
-        }
-        if normalized.hasPrefix("ls ") {
-            let tokens = normalized.split(whereSeparator: \.isWhitespace)
-            if tokens.first == "ls" {
-                let filtered = tokens.filter { $0 != "--color=auto" }
-                if filtered.count == 1 {
-                    return "ls"
-                }
-                normalized = filtered.joined(separator: " ")
-            }
-        }
-
-        return normalized
+        TerminalBlockStore.normalizeCommand(command)
     }
 
     private func isInternalHistoryCommand(_ command: String) -> Bool {
@@ -826,6 +856,22 @@ class SSHSession {
 
     private func isEnter(_ bytes: [UInt8]) -> Bool {
         bytes == [0x0D] || bytes == [0x0A]
+    }
+
+    private func isTab(_ bytes: [UInt8]) -> Bool {
+        bytes == [0x09]
+    }
+
+    private func isLeftArrow(_ bytes: [UInt8]) -> Bool {
+        bytes == [0x1B, 0x5B, 0x44] || csiUKeyCode(bytes) == 68
+    }
+
+    private func isRightArrow(_ bytes: [UInt8]) -> Bool {
+        bytes == [0x1B, 0x5B, 0x43] || csiUKeyCode(bytes) == 67
+    }
+
+    private func isArrowKey(_ bytes: [UInt8]) -> Bool {
+        isUpArrow(bytes) || isDownArrow(bytes) || isLeftArrow(bytes) || isRightArrow(bytes)
     }
 
     private func isUpArrow(_ bytes: [UInt8]) -> Bool {

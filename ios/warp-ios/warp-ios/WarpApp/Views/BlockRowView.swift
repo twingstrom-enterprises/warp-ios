@@ -85,10 +85,10 @@ struct BlockRowView: View {
                     Text("Running")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.cyan)
-                } else if let exitCode = block.exitCode {
+                } else if let exitCode = block.exitCode, exitCode != 0 {
                     Text("Exit \(exitCode)")
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(exitCode == 0 ? .green : .red)
+                        .foregroundStyle(.red)
                 }
             }
         }
